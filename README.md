@@ -36,7 +36,7 @@ sudo pacman -S sox curl jq xdotool python-gobject python-cairo
 
 ## Setup
 
-1. Clone this repo and make the scripts executable:
+#### 1. Clone this repo and make the scripts executable:
 
 ```bash
 git clone https://github.com/bmilleare/hotmic.git
@@ -44,7 +44,7 @@ cd hotmic
 chmod +x hotmic_toggle.sh hotmic_start.sh hotmic_stop.sh hotmic_indicator.py
 ```
 
-2. Set your OpenRouter API key:
+#### 2. Set your OpenRouter API key:
 
 ```bash
 export OPENROUTER_API_KEY="sk-or-v1-your-key-here"
@@ -52,7 +52,7 @@ export OPENROUTER_API_KEY="sk-or-v1-your-key-here"
 
 Add this to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) to persist it.
 
-3. Bind `hotmic_toggle.sh` to a keyboard shortcut in your desktop environment's settings. For example, in GNOME:
+#### 3. Bind `hotmic_toggle.sh` to a keyboard shortcut in your desktop environment's settings. For example, in GNOME:
 
 ```
 Settings > Keyboard > Custom Shortcuts > Add:
@@ -61,7 +61,7 @@ Settings > Keyboard > Custom Shortcuts > Add:
   Shortcut: (your choice, e.g. Super+D)
 ```
 
-4. Press your shortcut, speak, press it again. Text appears in the focused window.
+#### 4. Press your shortcut, speak, press it again. Text appears in the focused window.
 
 ## Configuration
 
