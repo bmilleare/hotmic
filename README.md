@@ -44,13 +44,19 @@ cd hotmic
 chmod +x hotmic_toggle.sh hotmic_start.sh hotmic_stop.sh hotmic_indicator.py
 ```
 
-#### 2. Set your OpenRouter API key:
+#### 2. Set your OpenRouter API key
+
+Create a `.env` file next to the scripts (recommended — works with any shell and keyboard shortcuts):
 
 ```bash
-export OPENROUTER_API_KEY="sk-or-v1-your-key-here"
+echo 'OPENROUTER_API_KEY="sk-or-v1-your-key-here"' > /path/to/hotmic/.env
 ```
 
-Add this to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.) to persist it.
+Alternatively, create `~/.config/hotmic/env` with the same content, or export it in your shell profile (`~/.bashrc`, `~/.zshrc`, etc.). The script checks these locations in order:
+
+1. Environment variable (already set)
+2. `.env` file next to the script
+3. `~/.config/hotmic/env`
 
 #### 3. Bind `hotmic_toggle.sh` to a keyboard shortcut in your desktop environment's settings. For example, in GNOME:
 

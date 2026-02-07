@@ -1,13 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Source zshrc for API keys when launched from desktop keybindings
-# (which don't run a zsh login shell)
-if [ -z "${OPENROUTER_API_KEY:-}" ] && [ -f "$HOME/.zshrc" ]; then
-    OPENROUTER_API_KEY=$(grep -oP '^export OPENROUTER_API_KEY=\K.*' "$HOME/.zshrc" || true)
-    export OPENROUTER_API_KEY
-fi
-
 # === Configuration ===
 OPENROUTER_MODEL="${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}"
 SILENCE_THRESH="1%"       # voice-activity threshold
@@ -34,7 +27,20 @@ for cmd in sox curl jq xdotool python3; do
     fi
 done
 
+# === Load API key (env var > .env file next to script > ~/.config/hotmic/env) ===
 if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    for _envfile in "$SCRIPT_DIR/.env" "$HOME/.config/hotmic/env"; do
+        if [ -f "$_envfile" ]; then
+            # shellcheck source=/dev/null
+            . "$_envfile"
+            break
+        fi
+    done
+    unset _envfile
+fi
+
+if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+    echo "OPENROUTER_API_KEY not set. See README.md for setup instructions." >&2
     exit 1
 fi
 
