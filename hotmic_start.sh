@@ -2,8 +2,11 @@
 set -euo pipefail
 
 # === Configuration ===
+HOTMIC_BACKEND="${HOTMIC_BACKEND:-whisper}"  # "whisper" (local) or "llm" (OpenRouter)
 OPENROUTER_MODEL="${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}"
-SILENCE_THRESH="1%"       # voice-activity threshold
+WHISPER_MODEL="${WHISPER_MODEL:-tiny}"
+WHISPER_DEVICE="${WHISPER_DEVICE:-cuda}"
+SILENCE_THRESH="0.1%"     # voice-activity threshold
 SILENCE_DUR="1.0"         # seconds of silence to end a chunk
 MAX_CHUNK_SEC="30"        # hard cap per chunk
 MIN_CHUNK_BYTES="2048"    # ignore chunks smaller than this (noise)
@@ -20,47 +23,91 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 SYSTEM_PROMPT="You are a speech-to-text transcriber. Output ONLY the verbatim spoken words. Never add quotes, labels, timestamps, commentary, or formatting. If the audio contains only silence, noise, or is unintelligible, respond with exactly: [SILENCE]"
 
-# === Dependency check ===
-for cmd in sox curl jq xdotool python3; do
-    if ! command -v "$cmd" >/dev/null 2>&1; then
+# === Quick dependency check (no heavy imports) ===
+for cmd in sox xdotool python3; do
+    command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
+done
+if [ "$HOTMIC_BACKEND" = "llm" ]; then
+    for cmd in curl jq; do
+        command -v "$cmd" >/dev/null 2>&1 || { echo "Required: $cmd" >&2; exit 1; }
+    done
+fi
+
+# === Load API key (only needed for LLM backend) ===
+if [ "$HOTMIC_BACKEND" = "llm" ]; then
+    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+        for _envfile in "$SCRIPT_DIR/.env" "$HOME/.config/hotmic/env"; do
+            if [ -f "$_envfile" ]; then
+                # shellcheck source=/dev/null
+                . "$_envfile"
+                break
+            fi
+        done
+        unset _envfile
+    fi
+    if [ -z "${OPENROUTER_API_KEY:-}" ]; then
+        echo "OPENROUTER_API_KEY not set. See README.md for setup instructions." >&2
         exit 1
     fi
-done
-
-# === Load API key (env var > .env file next to script > ~/.config/hotmic/env) ===
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    for _envfile in "$SCRIPT_DIR/.env" "$HOME/.config/hotmic/env"; do
-        if [ -f "$_envfile" ]; then
-            # shellcheck source=/dev/null
-            . "$_envfile"
-            break
-        fi
-    done
-    unset _envfile
 fi
 
-if [ -z "${OPENROUTER_API_KEY:-}" ]; then
-    echo "OPENROUTER_API_KEY not set. See README.md for setup instructions." >&2
-    exit 1
-fi
-
-# === Clean any previous session ===
-"$SCRIPT_DIR/hotmic_stop.sh" --quiet 2>/dev/null || true
-
-# === Setup ===
+# === Setup (create dirs first so cleanup + indicator can use them) ===
 mkdir -p "$DIR" "$CHUNK_DIR"
-touch "$STATE_FILE"
 : > "$LOG_FILE"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"; }
 
-# === Launch pulsing indicator ===
+# === Clean any previous session (non-blocking) ===
+"$SCRIPT_DIR/hotmic_stop.sh" --quiet 2>/dev/null || true
+
+touch "$STATE_FILE"
+
+# === Launch indicator + recording immediately (no delay) ===
 python3 "$SCRIPT_DIR/hotmic_indicator.py" &
 echo $! > "$DIR/indicator.pid"
 log "Indicator PID $(cat "$DIR/indicator.pid")"
 
-# === Transcribe and type a single chunk ===
-transcribe_chunk() {
+# === Launch whisper worker (model loads in background) ===
+WHISPER_FIFO="$DIR/whisper.fifo"
+if [ "$HOTMIC_BACKEND" = "whisper" ]; then
+    rm -f "$WHISPER_FIFO"
+    mkfifo "$WHISPER_FIFO"
+    WHISPER_MODEL="$WHISPER_MODEL" WHISPER_DEVICE="$WHISPER_DEVICE" \
+        python3 "$SCRIPT_DIR/hotmic_whisper_worker.py" &
+    echo $! > "$DIR/whisper_worker.pid"
+    log "Whisper worker PID $(cat "$DIR/whisper_worker.pid")"
+fi
+
+# === Transcribe via local whisper (send to persistent worker) ===
+transcribe_chunk_whisper() {
+    local chunk_file="$1" chunk_num="$2"
+    local txt_file="${chunk_file%.wav}.txt"
+
+    log "Chunk $chunk_num: $(stat -c%s "$chunk_file") bytes → whisper worker"
+
+    # Send chunk path to worker
+    echo "$chunk_file" > "$WHISPER_FIFO"
+
+    # Wait for result (worker writes .txt and deletes .wav)
+    local waited=0
+    while [ -f "$chunk_file" ] && [ "$waited" -lt 30 ]; do
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+
+    if [ -f "$txt_file" ]; then
+        local text
+        text=$(cat "$txt_file")
+        rm -f "$txt_file"
+        if [ -n "$text" ]; then
+            log "Transcribed: $text"
+            xdotool type --clearmodifiers --delay 0 -- "$text "
+        fi
+    fi
+}
+
+# === Transcribe via LLM (OpenRouter) ===
+transcribe_chunk_llm() {
     local chunk_file="$1" b64_file="$2" chunk_num="$3"
 
     log "Chunk $chunk_num: $(stat -c%s "$chunk_file") bytes → OpenRouter ($OPENROUTER_MODEL)"
@@ -113,6 +160,15 @@ transcribe_chunk() {
     rm -f "$chunk_file" "$b64_file"
 }
 
+# === Dispatch to the configured backend ===
+transcribe_chunk() {
+    if [ "$HOTMIC_BACKEND" = "whisper" ]; then
+        transcribe_chunk_whisper "$1" "$3"
+    else
+        transcribe_chunk_llm "$1" "$2" "$3"
+    fi
+}
+
 # === Recording loop (runs in background) ===
 (
     CHUNK_NUM=0
@@ -120,7 +176,11 @@ transcribe_chunk() {
     PENDING_CHUNK=""
     PENDING_B64=""
     PENDING_NUM=""
-    log "Recording loop started (model: $OPENROUTER_MODEL)"
+    if [ "$HOTMIC_BACKEND" = "whisper" ]; then
+        log "Recording loop started (backend: whisper, model: $WHISPER_MODEL)"
+    else
+        log "Recording loop started (backend: llm, model: $OPENROUTER_MODEL)"
+    fi
 
     while [ -f "$STATE_FILE" ]; do
         CHUNK_FILE="$CHUNK_DIR/chunk_${CHUNK_NUM}.wav"
@@ -148,6 +208,9 @@ transcribe_chunk() {
         STOPPING=false
         [ -f "$STATE_FILE" ] || STOPPING=true
 
+        FSIZE_DBG=$(stat -c%s "$CHUNK_FILE" 2>/dev/null || echo 0)
+        log "sox finished: exit=$SOX_EXIT size=$FSIZE_DBG stopping=$STOPPING chunk=$CHUNK_FILE"
+
         # Handle sox failure (mic disconnected, etc.) — only if we're still running
         if [ "$SOX_EXIT" -ne 0 ] && ! $STOPPING; then
             FAIL_COUNT=$((FAIL_COUNT + 1))
@@ -165,6 +228,7 @@ transcribe_chunk() {
         # Skip tiny chunks (silence artifacts / no speech captured)
         FSIZE=$(stat -c%s "$CHUNK_FILE" 2>/dev/null || echo 0)
         if [ "$FSIZE" -lt "$MIN_CHUNK_BYTES" ]; then
+            log "Chunk too small ($FSIZE bytes < $MIN_CHUNK_BYTES), skipping"
             rm -f "$CHUNK_FILE"
             $STOPPING && break
             continue
