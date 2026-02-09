@@ -10,12 +10,12 @@ Supports two transcription backends:
 ## How it works
 
 1. `hotmic_toggle.sh` starts/stops dictation via a single keybinding
-2. `sox` records from your microphone, splitting on speech pauses or every 10s
+2. `sox` records continuously from your microphone (no audio gaps)
 3. Each chunk is transcribed by the configured backend (local Whisper or OpenRouter LLM)
 4. The result is typed into the focused window via `xdotool`
 5. A pulsing red "REC" overlay badge shows while recording
 
-Audio is chunked (max 10s each) to keep memory usage low and provide near-real-time transcription. The Whisper model stays loaded in a persistent worker process to avoid reload latency between chunks.
+Audio is streamed continuously via a pipe to the worker process — no gaps between chunks. The worker splits on speech pauses or every 20s, and transcribes in a background thread while audio keeps flowing. The Whisper model stays loaded to avoid reload latency.
 
 ## Requirements
 
@@ -108,7 +108,7 @@ Edit the variables at the top of `hotmic_start.sh`, or override them via environ
 | `SILENCE_START_THRESH` | `3%` | Threshold to detect speech start (must be above ambient noise) |
 | `SILENCE_STOP_THRESH` | `3%` | Threshold to detect pauses (must be above ambient noise) |
 | `SILENCE_DUR` | `0.8` | Seconds of silence before a chunk ends |
-| `MAX_CHUNK_SEC` | `10` | Hard cap per chunk (shorter = more responsive) |
+| `MAX_CHUNK_SEC` | `20` | Hard cap per chunk (silence split handles most cases) |
 
 ## Files
 

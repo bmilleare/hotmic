@@ -15,15 +15,21 @@ kill_pid_file() {
 # Signal the loop to exit
 rm -f "$DIR/active"
 
-# Kill sox immediately so the mic stops
+# Kill sox immediately so the mic stops.
+# For whisper backend: this closes the pipe, which triggers the worker to
+# flush remaining audio, transcribe it, and exit cleanly.
 kill_pid_file "$DIR/rec.pid"
 
 # Kill the indicator immediately (visual feedback that we stopped)
 kill_pid_file "$DIR/indicator.pid"
 
-# Do NOT kill the whisper worker here — the recording loop will kill it
-# after processing the final chunk. This prevents the race condition where
-# the worker dies before the last transcription completes.
+# Safety net: kill any orphaned whisper workers after giving the pipeline
+# time to flush (background, with delay)
+(
+    sleep 5
+    pkill -f "hotmic_whisper_worker" 2>/dev/null || true
+    rm -f "$DIR/whisper_worker.pid" "$DIR/whisper.ready"
+) &
 
 if [ -f "$DIR/hotmic.log" ]; then
     echo "[$(date '+%H:%M:%S')] Dictation stopped" >> "$DIR/hotmic.log"

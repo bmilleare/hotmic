@@ -1,15 +1,46 @@
 #!/usr/bin/env python3
-"""Persistent whisper worker — loads model once, transcribes chunks from a FIFO."""
+"""
+Continuous audio reader, splitter, and transcriber.
 
+Sox pipes raw PCM into stdin. This process:
+1. Reads audio continuously (never misses a sample)
+2. Splits on silence or max duration
+3. Transcribes each chunk with faster-whisper in a background thread
+4. Types results into the active window via xdotool
+"""
+
+import io
 import os
 import sys
+import wave
+import struct
 import signal
+import math
+import subprocess
 import traceback
+from collections import deque
+from threading import Thread, Event
 
 DIR = "/tmp/hotmic"
-FIFO_PATH = f"{DIR}/whisper.fifo"
 READY_FILE = f"{DIR}/whisper.ready"
 LOG_FILE = f"{DIR}/hotmic.log"
+CHUNK_DIR = f"{DIR}/chunks"
+
+# Audio format (must match sox output)
+RATE = 16000
+CHANNELS = 1
+SAMPWIDTH = 2  # 16-bit
+
+# Splitting config (overridable via env)
+MAX_CHUNK_SEC = int(os.environ.get("MAX_CHUNK_SEC", "10"))
+SILENCE_DUR = float(os.environ.get("SILENCE_DUR", "0.8"))
+SILENCE_THRESH = float(os.environ.get("SILENCE_THRESH", "0.03"))  # 3% as fraction
+
+# Analysis block size
+BLOCK_SAMPLES = int(RATE * 0.05)  # 50ms blocks
+BLOCK_BYTES = BLOCK_SAMPLES * SAMPWIDTH
+SILENCE_BLOCKS = int(SILENCE_DUR / 0.05)  # blocks of silence needed to split
+MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 
 
 def log(msg):
@@ -18,12 +49,76 @@ def log(msg):
         f.write(f"[{datetime.now().strftime('%H:%M:%S')}] whisper-worker: {msg}\n")
 
 
+def rms(samples):
+    """Calculate RMS of 16-bit PCM samples."""
+    if not samples:
+        return 0.0
+    sum_sq = sum(s * s for s in samples)
+    return math.sqrt(sum_sq / len(samples)) / 32768.0
+
+
+def samples_to_wav(raw_samples, path):
+    """Write raw 16-bit PCM samples to a WAV file."""
+    data = struct.pack(f"<{len(raw_samples)}h", *raw_samples)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(CHANNELS)
+        wf.setsampwidth(SAMPWIDTH)
+        wf.setframerate(RATE)
+        wf.writeframes(data)
+
+
+def transcriber_loop(model, chunk_queue, stop_event):
+    """Background thread: transcribes chunks and types results."""
+    while not stop_event.is_set() or chunk_queue:
+        if not chunk_queue:
+            stop_event.wait(0.05)
+            continue
+
+        chunk_path, chunk_num = chunk_queue.popleft()
+
+        if not os.path.isfile(chunk_path):
+            continue
+
+        size = os.path.getsize(chunk_path)
+        log(f"transcribing chunk {chunk_num} ({size} bytes)")
+
+        try:
+            segments, _ = model.transcribe(
+                chunk_path,
+                language="en",
+                beam_size=1,
+                temperature=0,
+            )
+            text = " ".join(s.text for s in segments).strip()
+        except Exception as e:
+            log(f"transcribe error: {e}")
+            text = ""
+        finally:
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                pass
+
+        if not text:
+            log("empty transcription, skipping")
+            continue
+
+        log(f"transcribed: {text}")
+        try:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text + " "],
+                timeout=5,
+            )
+        except Exception as e:
+            log(f"xdotool error: {e}")
+
+
 def main():
     model_name = os.environ.get("WHISPER_MODEL", "medium.en")
     device = os.environ.get("WHISPER_DEVICE", "cuda")
-    # int8 for CUDA (Pascal-friendly, no Tensor cores needed), float32 for CPU
     compute_type = "int8" if device == "cuda" else "float32"
 
+    # Load model
     try:
         log(f"loading model={model_name} device={device} compute_type={compute_type}")
         from faster_whisper import WhisperModel
@@ -44,56 +139,84 @@ def main():
             traceback.print_exc(file=open(LOG_FILE, "a"))
             sys.exit(1)
 
-    # Signal readiness to bash script
+    # Signal readiness
     open(READY_FILE, "w").close()
 
     # Graceful shutdown
-    running = True
+    stop_event = Event()
     def handle_signal(signum, frame):
-        nonlocal running
-        running = False
+        stop_event.set()
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    while running:
-        try:
-            with open(FIFO_PATH, "r") as fifo:
-                for line in fifo:
-                    chunk_path = line.strip()
-                    if not chunk_path or not os.path.isfile(chunk_path):
-                        continue
+    # Start transcriber thread
+    os.makedirs(CHUNK_DIR, exist_ok=True)
+    chunk_queue = deque()
+    transcriber = Thread(target=transcriber_loop, args=(model, chunk_queue, stop_event), daemon=True)
+    transcriber.start()
 
-                    size = os.path.getsize(chunk_path)
-                    log(f"transcribing {chunk_path} ({size} bytes)")
+    # Read continuous PCM from stdin and split into chunks
+    chunk_num = 0
+    audio_buf = []
+    silent_blocks = 0
+    has_speech = False
+    max_samples = MAX_CHUNK_SEC * RATE
 
-                    try:
-                        segments, _ = model.transcribe(
-                            chunk_path,
-                            language="en",
-                            beam_size=1,
-                            temperature=0,
-                        )
-                        text = " ".join(s.text for s in segments).strip()
-                    except Exception as e:
-                        log(f"transcribe error: {e}")
-                        text = ""
-                    finally:
-                        os.remove(chunk_path)
+    log(f"reading audio (max_chunk={MAX_CHUNK_SEC}s, silence_dur={SILENCE_DUR}s, silence_thresh={SILENCE_THRESH})")
 
-                    if not text:
-                        log("empty transcription, skipping")
-                        continue
+    stdin = sys.stdin.buffer
+    try:
+        while not stop_event.is_set():
+            raw = stdin.read(BLOCK_BYTES)
+            if not raw:
+                break  # sox closed pipe (recording stopped)
 
-                    log(f"transcribed: {text}")
+            # Decode PCM samples
+            n_samples = len(raw) // SAMPWIDTH
+            samples = struct.unpack(f"<{n_samples}h", raw[:n_samples * SAMPWIDTH])
+            audio_buf.extend(samples)
 
-                    # Write result to a .txt file for the bash script to pick up
-                    result_path = chunk_path.rsplit(".", 1)[0] + ".txt"
-                    with open(result_path, "w") as f:
-                        f.write(text)
-        except OSError:
-            if running:
-                continue
-            break
+            # Analyse block
+            block_rms = rms(samples)
+            is_silent = block_rms < SILENCE_THRESH
+
+            if not is_silent:
+                has_speech = True
+                silent_blocks = 0
+            else:
+                silent_blocks += 1
+
+            # Split conditions
+            should_split = False
+            if has_speech and silent_blocks >= SILENCE_BLOCKS and len(audio_buf) >= MIN_CHUNK_SAMPLES:
+                should_split = True  # natural pause
+            elif len(audio_buf) >= max_samples:
+                should_split = True  # hard cap
+
+            if should_split:
+                chunk_path = os.path.join(CHUNK_DIR, f"chunk_{chunk_num}.wav")
+                samples_to_wav(audio_buf, chunk_path)
+                log(f"chunk {chunk_num}: {len(audio_buf)} samples ({len(audio_buf)/RATE:.1f}s) → queue")
+                chunk_queue.append((chunk_path, chunk_num))
+                chunk_num += 1
+                audio_buf = []
+                silent_blocks = 0
+                has_speech = False
+
+    except Exception as e:
+        log(f"reader error: {e}")
+
+    # Flush remaining audio
+    if audio_buf and has_speech and len(audio_buf) >= MIN_CHUNK_SAMPLES:
+        chunk_path = os.path.join(CHUNK_DIR, f"chunk_{chunk_num}.wav")
+        samples_to_wav(audio_buf, chunk_path)
+        log(f"final chunk {chunk_num}: {len(audio_buf)} samples ({len(audio_buf)/RATE:.1f}s) → queue")
+        chunk_queue.append((chunk_path, chunk_num))
+
+    # Wait for transcriber to finish remaining chunks
+    log("waiting for transcription to complete...")
+    stop_event.set()
+    transcriber.join(timeout=30)
 
     # Cleanup
     try:
