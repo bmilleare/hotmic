@@ -4,7 +4,7 @@ set -euo pipefail
 # === Configuration ===
 HOTMIC_BACKEND="${HOTMIC_BACKEND:-whisper}"  # "whisper" (local) or "llm" (OpenRouter)
 OPENROUTER_MODEL="${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}"
-WHISPER_MODEL="${WHISPER_MODEL:-tiny}"
+WHISPER_MODEL="${WHISPER_MODEL:-medium.en}"
 WHISPER_DEVICE="${WHISPER_DEVICE:-cuda}"
 SILENCE_START_THRESH="3%"    # threshold to detect speech start (must be above ambient noise)
 SILENCE_STOP_THRESH="3%"     # threshold to detect pause (must be above ambient noise)
@@ -75,7 +75,11 @@ if [ "$HOTMIC_BACKEND" = "whisper" ]; then
     pkill -f "hotmic_whisper_worker" 2>/dev/null || true
     rm -f "$WHISPER_FIFO" "$DIR/whisper.ready"
     mkfifo "$WHISPER_FIFO"
+    # Add pip-installed NVIDIA library paths for CTranslate2
+    NVIDIA_LIB_DIR="$(python3 -c 'import nvidia.cublas.lib; print(nvidia.cublas.lib.__path__[0])' 2>/dev/null || true)"
+    CUDNN_LIB_DIR="$(python3 -c 'import nvidia.cudnn.lib; print(nvidia.cudnn.lib.__path__[0])' 2>/dev/null || true)"
     WHISPER_MODEL="$WHISPER_MODEL" WHISPER_DEVICE="$WHISPER_DEVICE" \
+        LD_LIBRARY_PATH="${NVIDIA_LIB_DIR:+$NVIDIA_LIB_DIR:}${CUDNN_LIB_DIR:+$CUDNN_LIB_DIR:}${LD_LIBRARY_PATH:-}" \
         python3 "$SCRIPT_DIR/hotmic_whisper_worker.py" >> "$LOG_FILE" 2>&1 &
     echo $! > "$DIR/whisper_worker.pid"
     log "Whisper worker PID $(cat "$DIR/whisper_worker.pid")"
@@ -88,14 +92,14 @@ transcribe_chunk_whisper() {
 
     log "Chunk $chunk_num: $(stat -c%s "$chunk_file") bytes → whisper worker"
 
-    # Wait for worker to be ready (model loaded)
+    # Wait for worker to be ready (model loading can take 10-15s on first run)
     local waited=0
-    while [ ! -f "$DIR/whisper.ready" ] && [ "$waited" -lt 30 ]; do
+    while [ ! -f "$DIR/whisper.ready" ] && [ "$waited" -lt 150 ]; do
         sleep 0.2
         waited=$((waited + 1))
     done
     if [ ! -f "$DIR/whisper.ready" ]; then
-        log "Whisper worker not ready after 6s, skipping chunk $chunk_num"
+        log "Whisper worker not ready after 30s, skipping chunk $chunk_num"
         rm -f "$chunk_file"
         return
     fi

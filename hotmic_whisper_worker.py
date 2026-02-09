@@ -19,21 +19,21 @@ def log(msg):
 
 
 def main():
-    model_name = os.environ.get("WHISPER_MODEL", "tiny")
+    model_name = os.environ.get("WHISPER_MODEL", "medium.en")
     device = os.environ.get("WHISPER_DEVICE", "cuda")
-    fp16 = device == "cuda"
+    # int8 for CUDA (Pascal-friendly, no Tensor cores needed), float32 for CPU
+    compute_type = "int8" if device == "cuda" else "float32"
 
     try:
-        log(f"loading model={model_name} device={device}")
-        import whisper
-        model = whisper.load_model(model_name, device=device)
+        log(f"loading model={model_name} device={device} compute_type={compute_type}")
+        from faster_whisper import WhisperModel
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
         log("model loaded, ready for chunks")
     except Exception as e:
         if device != "cpu":
             log(f"CUDA failed ({e}), falling back to CPU")
             try:
-                model = whisper.load_model(model_name, device="cpu")
-                fp16 = False
+                model = WhisperModel(model_name, device="cpu", compute_type="float32")
                 log("model loaded on CPU, ready for chunks")
             except Exception as e2:
                 log(f"FATAL: failed to load model on CPU: {e2}")
@@ -67,15 +67,13 @@ def main():
                     log(f"transcribing {chunk_path} ({size} bytes)")
 
                     try:
-                        result = model.transcribe(
+                        segments, _ = model.transcribe(
                             chunk_path,
                             language="en",
-                            temperature=0,
                             beam_size=1,
-                            best_of=1,
-                            fp16=fp16,
+                            temperature=0,
                         )
-                        text = result.get("text", "").strip()
+                        text = " ".join(s.text for s in segments).strip()
                     except Exception as e:
                         log(f"transcribe error: {e}")
                         text = ""

@@ -4,7 +4,7 @@ Speech-to-text dictation for Linux. Speak into your microphone and text appears 
 
 Supports two transcription backends:
 
-- **Local Whisper** (default) — fast, private, no API key needed. Uses OpenAI's [Whisper](https://github.com/openai/whisper) running locally with GPU acceleration.
+- **Local Whisper** (default) — fast, private, no API key needed. Uses [faster-whisper](https://github.com/SYSTRAN/faster-whisper) (CTranslate2 backend) for 2-4x faster inference than stock Whisper, with GPU acceleration.
 - **LLM via OpenRouter** — uses any audio-capable model on [OpenRouter](https://openrouter.ai/) (defaults to Gemini 2.0 Flash).
 
 ## How it works
@@ -25,8 +25,9 @@ Audio is chunked (max 10s each) to keep memory usage low and provide near-real-t
 - `python3` with PyGObject and cairo (for the recording indicator)
 
 **For Whisper backend** (default):
-- `python3` with `openai-whisper` installed (`pip install openai-whisper`)
+- `python3` with `faster-whisper` installed (`pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12`)
 - CUDA GPU recommended (falls back to CPU)
+- For GPU: NVIDIA CUDA libraries (`pip install nvidia-cublas-cu12 nvidia-cudnn-cu12`)
 
 **For LLM backend:**
 - `curl`
@@ -39,7 +40,7 @@ Audio is chunked (max 10s each) to keep memory usage low and provide near-real-t
 sudo apt install sox xdotool python3-gi python3-gi-cairo gir1.2-gtk-3.0
 
 # For whisper backend:
-pip install openai-whisper
+pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12
 
 # For LLM backend:
 sudo apt install curl jq
@@ -51,7 +52,7 @@ sudo apt install curl jq
 sudo pacman -S sox xdotool python-gobject python-cairo
 
 # For whisper backend:
-pip install openai-whisper
+pip install faster-whisper nvidia-cublas-cu12 nvidia-cudnn-cu12
 
 # For LLM backend:
 sudo pacman -S curl jq
@@ -101,7 +102,7 @@ Edit the variables at the top of `hotmic_start.sh`, or override them via environ
 | Variable | Default | Description |
 |---|---|---|
 | `HOTMIC_BACKEND` | `whisper` | `whisper` (local) or `llm` (OpenRouter) |
-| `WHISPER_MODEL` | `tiny` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
+| `WHISPER_MODEL` | `medium.en` | Whisper model: `tiny`, `base`, `small`, `medium.en`, `large-v3-turbo`, etc. |
 | `WHISPER_DEVICE` | `cuda` | `cuda` for GPU, `cpu` for CPU-only |
 | `OPENROUTER_MODEL` | `google/gemini-2.0-flash-001` | Any audio-capable model on OpenRouter (LLM backend only) |
 | `SILENCE_START_THRESH` | `3%` | Threshold to detect speech start (must be above ambient noise) |
