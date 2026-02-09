@@ -10,12 +10,12 @@ Supports two transcription backends:
 ## How it works
 
 1. `hotmic_toggle.sh` starts/stops dictation via a single keybinding
-2. `sox` records from your microphone, splitting on natural speech pauses (1s of silence)
+2. `sox` records from your microphone, splitting on speech pauses or every 10s
 3. Each chunk is transcribed by the configured backend (local Whisper or OpenRouter LLM)
 4. The result is typed into the focused window via `xdotool`
 5. A pulsing red "REC" overlay badge shows while recording
 
-Audio is chunked (max 30s each) to keep memory usage low and provide near-real-time transcription.
+Audio is chunked (max 10s each) to keep memory usage low and provide near-real-time transcription. The Whisper model stays loaded in a persistent worker process to avoid reload latency between chunks.
 
 ## Requirements
 
@@ -104,9 +104,10 @@ Edit the variables at the top of `hotmic_start.sh`, or override them via environ
 | `WHISPER_MODEL` | `tiny` | Whisper model size: `tiny`, `base`, `small`, `medium`, `large` |
 | `WHISPER_DEVICE` | `cuda` | `cuda` for GPU, `cpu` for CPU-only |
 | `OPENROUTER_MODEL` | `google/gemini-2.0-flash-001` | Any audio-capable model on OpenRouter (LLM backend only) |
-| `SILENCE_THRESH` | `0.1%` | Voice activity detection threshold (lower = more sensitive) |
-| `SILENCE_DUR` | `1.0` | Seconds of silence before a chunk ends |
-| `MAX_CHUNK_SEC` | `30` | Maximum duration per chunk |
+| `SILENCE_START_THRESH` | `3%` | Threshold to detect speech start (must be above ambient noise) |
+| `SILENCE_STOP_THRESH` | `3%` | Threshold to detect pauses (must be above ambient noise) |
+| `SILENCE_DUR` | `0.8` | Seconds of silence before a chunk ends |
+| `MAX_CHUNK_SEC` | `10` | Hard cap per chunk (shorter = more responsive) |
 
 ## Files
 

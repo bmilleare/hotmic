@@ -6,9 +6,10 @@ HOTMIC_BACKEND="${HOTMIC_BACKEND:-whisper}"  # "whisper" (local) or "llm" (OpenR
 OPENROUTER_MODEL="${OPENROUTER_MODEL:-google/gemini-2.0-flash-001}"
 WHISPER_MODEL="${WHISPER_MODEL:-tiny}"
 WHISPER_DEVICE="${WHISPER_DEVICE:-cuda}"
-SILENCE_THRESH="0.1%"     # voice-activity threshold
-SILENCE_DUR="1.0"         # seconds of silence to end a chunk
-MAX_CHUNK_SEC="30"        # hard cap per chunk
+SILENCE_START_THRESH="3%"    # threshold to detect speech start (must be above ambient noise)
+SILENCE_STOP_THRESH="3%"     # threshold to detect pause (must be above ambient noise)
+SILENCE_DUR="0.8"            # seconds of silence to end a chunk
+MAX_CHUNK_SEC="10"           # hard cap per chunk (ensures background transcription)
 MIN_CHUNK_BYTES="2048"    # ignore chunks smaller than this (noise)
 CURL_TIMEOUT="15"         # API request timeout (LLM inference is slower than dedicated STT)
 SOX_RATE="16000"
@@ -70,10 +71,12 @@ log "Indicator PID $(cat "$DIR/indicator.pid")"
 # === Launch whisper worker (model loads in background) ===
 WHISPER_FIFO="$DIR/whisper.fifo"
 if [ "$HOTMIC_BACKEND" = "whisper" ]; then
-    rm -f "$WHISPER_FIFO"
+    # Kill any orphaned workers from previous sessions before starting fresh
+    pkill -f "hotmic_whisper_worker" 2>/dev/null || true
+    rm -f "$WHISPER_FIFO" "$DIR/whisper.ready"
     mkfifo "$WHISPER_FIFO"
     WHISPER_MODEL="$WHISPER_MODEL" WHISPER_DEVICE="$WHISPER_DEVICE" \
-        python3 "$SCRIPT_DIR/hotmic_whisper_worker.py" &
+        python3 "$SCRIPT_DIR/hotmic_whisper_worker.py" >> "$LOG_FILE" 2>&1 &
     echo $! > "$DIR/whisper_worker.pid"
     log "Whisper worker PID $(cat "$DIR/whisper_worker.pid")"
 fi
@@ -85,11 +88,27 @@ transcribe_chunk_whisper() {
 
     log "Chunk $chunk_num: $(stat -c%s "$chunk_file") bytes → whisper worker"
 
-    # Send chunk path to worker
-    echo "$chunk_file" > "$WHISPER_FIFO"
+    # Wait for worker to be ready (model loaded)
+    local waited=0
+    while [ ! -f "$DIR/whisper.ready" ] && [ "$waited" -lt 30 ]; do
+        sleep 0.2
+        waited=$((waited + 1))
+    done
+    if [ ! -f "$DIR/whisper.ready" ]; then
+        log "Whisper worker not ready after 6s, skipping chunk $chunk_num"
+        rm -f "$chunk_file"
+        return
+    fi
+
+    # Send chunk path to worker (non-blocking with timeout)
+    timeout 2 bash -c "echo '$chunk_file' > '$WHISPER_FIFO'" 2>/dev/null || {
+        log "FIFO write timed out, skipping chunk $chunk_num"
+        rm -f "$chunk_file"
+        return
+    }
 
     # Wait for result (worker writes .txt and deletes .wav)
-    local waited=0
+    waited=0
     while [ -f "$chunk_file" ] && [ "$waited" -lt 30 ]; do
         sleep 0.2
         waited=$((waited + 1))
@@ -191,7 +210,7 @@ transcribe_chunk() {
         sox -q -d \
             -c "$SOX_CHANNELS" -r "$SOX_RATE" -b "$SOX_BITS" -e signed-integer \
             -t wav "$CHUNK_FILE" \
-            silence 1 0.1 "$SILENCE_THRESH" 1 "$SILENCE_DUR" "$SILENCE_THRESH" \
+            silence 1 0.1 "$SILENCE_START_THRESH" 1 "$SILENCE_DUR" "$SILENCE_STOP_THRESH" \
             trim 0 "$MAX_CHUNK_SEC" 2>>"$LOG_FILE" &
         SOX_PID=$!
         echo "$SOX_PID" > "$DIR/rec.pid"
@@ -250,6 +269,14 @@ transcribe_chunk() {
     if [ -n "$PENDING_CHUNK" ]; then
         transcribe_chunk "$PENDING_CHUNK" "$PENDING_B64" "$PENDING_NUM"
     fi
+
+    # Clean up whisper worker now that all transcription is done
+    if [ -f "$DIR/whisper_worker.pid" ]; then
+        kill "$(cat "$DIR/whisper_worker.pid" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$DIR/whisper_worker.pid"
+    fi
+    rm -f "$DIR/whisper.fifo" "$DIR/whisper.ready"
+    pkill -f "hotmic_whisper_worker" 2>/dev/null || true
 
     log "Recording loop exited"
     rm -f "$DIR/loop.pid"

@@ -4,14 +4,17 @@
 import os
 import sys
 import signal
+import traceback
 
-FIFO_PATH = "/tmp/hotmic/whisper.fifo"
-LOG_FILE = "/tmp/hotmic/hotmic.log"
+DIR = "/tmp/hotmic"
+FIFO_PATH = f"{DIR}/whisper.fifo"
+READY_FILE = f"{DIR}/whisper.ready"
+LOG_FILE = f"{DIR}/hotmic.log"
 
 
 def log(msg):
+    from datetime import datetime
     with open(LOG_FILE, "a") as f:
-        from datetime import datetime
         f.write(f"[{datetime.now().strftime('%H:%M:%S')}] whisper-worker: {msg}\n")
 
 
@@ -20,12 +23,29 @@ def main():
     device = os.environ.get("WHISPER_DEVICE", "cuda")
     fp16 = device == "cuda"
 
-    log(f"loading model={model_name} device={device}")
+    try:
+        log(f"loading model={model_name} device={device}")
+        import whisper
+        model = whisper.load_model(model_name, device=device)
+        log("model loaded, ready for chunks")
+    except Exception as e:
+        if device != "cpu":
+            log(f"CUDA failed ({e}), falling back to CPU")
+            try:
+                model = whisper.load_model(model_name, device="cpu")
+                fp16 = False
+                log("model loaded on CPU, ready for chunks")
+            except Exception as e2:
+                log(f"FATAL: failed to load model on CPU: {e2}")
+                traceback.print_exc(file=open(LOG_FILE, "a"))
+                sys.exit(1)
+        else:
+            log(f"FATAL: failed to load model: {e}")
+            traceback.print_exc(file=open(LOG_FILE, "a"))
+            sys.exit(1)
 
-    import whisper
-    model = whisper.load_model(model_name, device=device)
-
-    log("model loaded, ready for chunks")
+    # Signal readiness to bash script
+    open(READY_FILE, "w").close()
 
     # Graceful shutdown
     running = True
@@ -77,6 +97,11 @@ def main():
                 continue
             break
 
+    # Cleanup
+    try:
+        os.remove(READY_FILE)
+    except OSError:
+        pass
     log("worker exiting")
 
 
