@@ -3,13 +3,13 @@
 Continuous audio reader, splitter, and transcriber.
 
 Sox pipes raw PCM into stdin. This process:
-1. Reads audio continuously (never misses a sample)
-2. Splits on silence or max duration
-3. Transcribes each chunk with faster-whisper in a background thread
-4. Types results into the active window via xdotool
+1. Immediately starts reading audio (keeps the pipe drained)
+2. Loads the whisper model in the background
+3. Splits audio on silence or max duration
+4. Transcribes each chunk in a background thread
+5. Types results into the active window via xdotool
 """
 
-import io
 import os
 import sys
 import wave
@@ -32,7 +32,7 @@ CHANNELS = 1
 SAMPWIDTH = 2  # 16-bit
 
 # Splitting config (overridable via env)
-MAX_CHUNK_SEC = int(os.environ.get("MAX_CHUNK_SEC", "10"))
+MAX_CHUNK_SEC = int(os.environ.get("MAX_CHUNK_SEC", "20"))
 SILENCE_DUR = float(os.environ.get("SILENCE_DUR", "0.8"))
 SILENCE_THRESH = float(os.environ.get("SILENCE_THRESH", "0.03"))  # 3% as fraction
 
@@ -67,95 +67,8 @@ def samples_to_wav(raw_samples, path):
         wf.writeframes(data)
 
 
-def transcriber_loop(model, chunk_queue, stop_event):
-    """Background thread: transcribes chunks and types results."""
-    while not stop_event.is_set() or chunk_queue:
-        if not chunk_queue:
-            stop_event.wait(0.05)
-            continue
-
-        chunk_path, chunk_num = chunk_queue.popleft()
-
-        if not os.path.isfile(chunk_path):
-            continue
-
-        size = os.path.getsize(chunk_path)
-        log(f"transcribing chunk {chunk_num} ({size} bytes)")
-
-        try:
-            segments, _ = model.transcribe(
-                chunk_path,
-                language="en",
-                beam_size=1,
-                temperature=0,
-            )
-            text = " ".join(s.text for s in segments).strip()
-        except Exception as e:
-            log(f"transcribe error: {e}")
-            text = ""
-        finally:
-            try:
-                os.remove(chunk_path)
-            except OSError:
-                pass
-
-        if not text:
-            log("empty transcription, skipping")
-            continue
-
-        log(f"transcribed: {text}")
-        try:
-            subprocess.run(
-                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text + " "],
-                timeout=5,
-            )
-        except Exception as e:
-            log(f"xdotool error: {e}")
-
-
-def main():
-    model_name = os.environ.get("WHISPER_MODEL", "medium.en")
-    device = os.environ.get("WHISPER_DEVICE", "cuda")
-    compute_type = "int8" if device == "cuda" else "float32"
-
-    # Load model
-    try:
-        log(f"loading model={model_name} device={device} compute_type={compute_type}")
-        from faster_whisper import WhisperModel
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        log("model loaded, ready for chunks")
-    except Exception as e:
-        if device != "cpu":
-            log(f"CUDA failed ({e}), falling back to CPU")
-            try:
-                model = WhisperModel(model_name, device="cpu", compute_type="float32")
-                log("model loaded on CPU, ready for chunks")
-            except Exception as e2:
-                log(f"FATAL: failed to load model on CPU: {e2}")
-                traceback.print_exc(file=open(LOG_FILE, "a"))
-                sys.exit(1)
-        else:
-            log(f"FATAL: failed to load model: {e}")
-            traceback.print_exc(file=open(LOG_FILE, "a"))
-            sys.exit(1)
-
-    # Signal readiness
-    open(READY_FILE, "w").close()
-
-    # Graceful shutdown
-    stop_event = Event()
-    def handle_signal(signum, frame):
-        stop_event.set()
-    signal.signal(signal.SIGTERM, handle_signal)
-    signal.signal(signal.SIGINT, handle_signal)
-
-    # Start transcriber thread
-    os.makedirs(CHUNK_DIR, exist_ok=True)
-    chunk_queue = deque()
-    transcriber = Thread(target=transcriber_loop, args=(model, chunk_queue, stop_event), daemon=True)
-    transcriber.start()
-
-    # Read continuous PCM from stdin and split into chunks
+def reader_loop(chunk_queue, stop_event):
+    """Read continuous PCM from stdin and split into chunks. Runs immediately."""
     chunk_num = 0
     audio_buf = []
     silent_blocks = 0
@@ -213,7 +126,123 @@ def main():
         log(f"final chunk {chunk_num}: {len(audio_buf)} samples ({len(audio_buf)/RATE:.1f}s) → queue")
         chunk_queue.append((chunk_path, chunk_num))
 
-    # Wait for transcriber to finish remaining chunks
+    log("reader finished")
+
+
+def transcriber_loop(model_holder, chunk_queue, stop_event):
+    """Background thread: waits for model, then transcribes chunks and types results."""
+    # Wait for model to be loaded
+    while not model_holder and not stop_event.is_set():
+        stop_event.wait(0.1)
+
+    if not model_holder:
+        return
+
+    model = model_holder[0]
+    log("transcriber ready")
+
+    while not stop_event.is_set() or chunk_queue:
+        if not chunk_queue:
+            stop_event.wait(0.05)
+            continue
+
+        chunk_path, chunk_num = chunk_queue.popleft()
+
+        if not os.path.isfile(chunk_path):
+            continue
+
+        size = os.path.getsize(chunk_path)
+        log(f"transcribing chunk {chunk_num} ({size} bytes)")
+
+        try:
+            segments, _ = model.transcribe(
+                chunk_path,
+                language="en",
+                beam_size=1,
+                temperature=0,
+            )
+            text = " ".join(s.text for s in segments).strip()
+        except Exception as e:
+            log(f"transcribe error: {e}")
+            text = ""
+        finally:
+            try:
+                os.remove(chunk_path)
+            except OSError:
+                pass
+
+        if not text:
+            log("empty transcription, skipping")
+            continue
+
+        log(f"transcribed: {text}")
+        try:
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text + " "],
+                timeout=5,
+            )
+        except Exception as e:
+            log(f"xdotool error: {e}")
+
+
+def main():
+    model_name = os.environ.get("WHISPER_MODEL", "medium.en")
+    device = os.environ.get("WHISPER_DEVICE", "cuda")
+    compute_type = "int8" if device == "cuda" else "float32"
+
+    os.makedirs(CHUNK_DIR, exist_ok=True)
+
+    # Graceful shutdown
+    stop_event = Event()
+    def handle_signal(signum, frame):
+        stop_event.set()
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    # Shared model holder (list so transcriber thread can see when it's loaded)
+    model_holder = []
+    chunk_queue = deque()
+
+    # Start reader thread IMMEDIATELY — keeps the pipe drained while model loads
+    reader = Thread(target=reader_loop, args=(chunk_queue, stop_event), daemon=True)
+    reader.start()
+
+    # Start transcriber thread (waits for model internally)
+    transcriber = Thread(target=transcriber_loop, args=(model_holder, chunk_queue, stop_event), daemon=True)
+    transcriber.start()
+
+    # Load model on main thread (slow, but reader is already draining the pipe)
+    try:
+        log(f"loading model={model_name} device={device} compute_type={compute_type}")
+        from faster_whisper import WhisperModel
+        model = WhisperModel(model_name, device=device, compute_type=compute_type)
+        model_holder.append(model)
+        log("model loaded, ready for chunks")
+    except Exception as e:
+        if device != "cpu":
+            log(f"CUDA failed ({e}), falling back to CPU")
+            try:
+                model = WhisperModel(model_name, device="cpu", compute_type="float32")
+                model_holder.append(model)
+                log("model loaded on CPU, ready for chunks")
+            except Exception as e2:
+                log(f"FATAL: failed to load model on CPU: {e2}")
+                traceback.print_exc(file=open(LOG_FILE, "a"))
+                stop_event.set()
+                sys.exit(1)
+        else:
+            log(f"FATAL: failed to load model: {e}")
+            traceback.print_exc(file=open(LOG_FILE, "a"))
+            stop_event.set()
+            sys.exit(1)
+
+    # Signal readiness
+    open(READY_FILE, "w").close()
+
+    # Wait for reader to finish (pipe closed = sox died or was killed)
+    reader.join()
+
+    # Give transcriber time to process remaining chunks
     log("waiting for transcription to complete...")
     stop_event.set()
     transcriber.join(timeout=30)
