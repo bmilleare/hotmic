@@ -12,21 +12,30 @@ kill_pid_file() {
     rm -f "$pf"
 }
 
-# Signal the loop to exit
+# Signal the loop to exit (LLM backend)
 rm -f "$DIR/active"
 
 # Kill sox immediately so the mic stops.
-# This closes the pipe → worker gets EOF → reader finishes.
-# The worker continues running to load the model (if still loading)
-# and transcribe remaining chunks, then exits on its own.
+# For whisper backend: this closes the FIFO write end, the daemon gets EOF,
+# transcribes remaining audio, then waits for the next session.
+# The daemon stays running with the model loaded — no restart needed.
 kill_pid_file "$DIR/rec.pid"
 
 # Kill the indicator immediately (visual feedback that we stopped)
 kill_pid_file "$DIR/indicator.pid"
 
-# NOTE: We intentionally do NOT kill the whisper worker here.
-# It needs time to finish model loading and transcribe the final audio.
-# Stale workers are cleaned up by the start script when beginning a new session.
+# Kill the LLM backend loop if running
+kill_pid_file "$DIR/loop.pid"
+
+# NOTE: We intentionally do NOT kill the whisper daemon.
+# It stays resident with the model loaded for instant next-session startup.
+# To fully stop the daemon: hotmic_stop.sh --daemon
+
+if [ "${1:-}" = "--daemon" ]; then
+    kill_pid_file "$DIR/whisper_worker.pid"
+    pkill -9 -f "hotmic_whisper_worker" 2>/dev/null || true
+    rm -f "$DIR/whisper.ready" "$DIR/audio.fifo"
+fi
 
 if [ -f "$DIR/hotmic.log" ]; then
     echo "[$(date '+%H:%M:%S')] Dictation stopped" >> "$DIR/hotmic.log"

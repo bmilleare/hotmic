@@ -53,11 +53,12 @@ fi
 
 # === Setup ===
 mkdir -p "$DIR" "$CHUNK_DIR"
-: > "$LOG_FILE"
+# Don't truncate log — daemon is persistent and logs span sessions
+touch "$LOG_FILE"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG_FILE"; }
 
-# === Clean any previous session ===
+# === Clean any previous recording (not the daemon) ===
 "$SCRIPT_DIR/hotmic_stop.sh" --quiet 2>/dev/null || true
 
 touch "$STATE_FILE"
@@ -68,57 +69,59 @@ echo $! > "$DIR/indicator.pid"
 log "Indicator PID $(cat "$DIR/indicator.pid")"
 
 # ===========================================================================
-# WHISPER BACKEND: continuous sox → pipe → Python worker (split + transcribe)
+# WHISPER BACKEND: persistent daemon + sox → FIFO
+# The daemon loads the model ONCE and stays resident. Each dictation session
+# just starts sox piping audio to the daemon's FIFO.
 # ===========================================================================
 if [ "$HOTMIC_BACKEND" = "whisper" ]; then
-    # Kill any orphaned workers aggressively (SIGKILL) to ensure GPU memory is freed.
-    # A worker killed mid-model-load can leave CUDA in a dirty state, causing the
-    # next worker's model load to hang indefinitely.
-    if pgrep -f "hotmic_whisper_worker" >/dev/null 2>&1; then
-        pkill -9 -f "hotmic_whisper_worker" 2>/dev/null || true
-        sleep 1  # allow GPU memory to be reclaimed by the kernel
-    fi
+    # Save the target window ID — text will be typed into this window
+    # even if focus changes during transcription
+    xdotool getactivewindow > "$DIR/window_id" 2>/dev/null || true
 
-    # Resolve NVIDIA library paths for CTranslate2
-    NVIDIA_LIB_DIR="$(python3 -c 'import nvidia.cublas.lib; print(nvidia.cublas.lib.__path__[0])' 2>/dev/null || true)"
-    CUDNN_LIB_DIR="$(python3 -c 'import nvidia.cudnn.lib; print(nvidia.cudnn.lib.__path__[0])' 2>/dev/null || true)"
+    # Start daemon if not already running
+    if ! pgrep -f "hotmic_whisper_worker" >/dev/null 2>&1; then
+        log "Starting whisper daemon..."
 
-    # Single continuous sox recording piped to the worker.
-    # The worker handles splitting, transcription, and typing — no audio gaps.
-    (
-        # Disable pipefail so that sox being killed (non-zero exit) doesn't
-        # abort the subshell before the worker can flush and transcribe.
-        set +o pipefail
+        # Resolve NVIDIA library paths for CTranslate2
+        NVIDIA_LIB_DIR="$(python3 -c 'import nvidia.cublas.lib; print(nvidia.cublas.lib.__path__[0])' 2>/dev/null || true)"
+        CUDNN_LIB_DIR="$(python3 -c 'import nvidia.cudnn.lib; print(nvidia.cudnn.lib.__path__[0])' 2>/dev/null || true)"
 
-        sox -q -d -c "$SOX_CHANNELS" -r "$SOX_RATE" -b "$SOX_BITS" -e signed-integer -t raw - 2>>"$LOG_FILE" \
-        | WHISPER_MODEL="$WHISPER_MODEL" WHISPER_DEVICE="$WHISPER_DEVICE" \
+        WHISPER_MODEL="$WHISPER_MODEL" WHISPER_DEVICE="$WHISPER_DEVICE" \
             MAX_CHUNK_SEC="$MAX_CHUNK_SEC" SILENCE_DUR="$SILENCE_DUR" SILENCE_THRESH="0.03" \
             LD_LIBRARY_PATH="${NVIDIA_LIB_DIR:+$NVIDIA_LIB_DIR:}${CUDNN_LIB_DIR:+$CUDNN_LIB_DIR:}${LD_LIBRARY_PATH:-}" \
-            python3 "$SCRIPT_DIR/hotmic_whisper_worker.py" >> "$LOG_FILE" 2>&1 || true
+            python3 "$SCRIPT_DIR/hotmic_whisper_worker.py" >> "$LOG_FILE" 2>&1 &
+        echo $! > "$DIR/whisper_worker.pid"
 
-        # When sox or worker exits, clean up
-        if [ -f "$DIR/whisper_worker.pid" ]; then
-            kill "$(cat "$DIR/whisper_worker.pid" 2>/dev/null)" 2>/dev/null || true
-            rm -f "$DIR/whisper_worker.pid"
+        # Wait for daemon to be ready (FIFO created, accepting audio).
+        # Model loads in background — first session starts recording immediately.
+        TIMEOUT=30
+        while [ "$TIMEOUT" -gt 0 ] && [ ! -f "$DIR/whisper.ready" ]; do
+            if ! kill -0 "$(cat "$DIR/whisper_worker.pid" 2>/dev/null)" 2>/dev/null; then
+                log "FATAL: whisper daemon died during startup"
+                rm -f "$STATE_FILE"
+                exit 1
+            fi
+            sleep 0.5
+            TIMEOUT=$((TIMEOUT - 1))
+        done
+        if [ ! -f "$DIR/whisper.ready" ]; then
+            log "FATAL: whisper daemon timed out during startup"
+            rm -f "$STATE_FILE"
+            exit 1
         fi
-        pkill -f "hotmic_whisper_worker" 2>/dev/null || true
-        rm -f "$DIR/whisper.ready"
-        log "Recording pipeline exited"
-        rm -f "$DIR/loop.pid"
-    ) &
-    LOOP_PID=$!
-    echo "$LOOP_PID" > "$DIR/loop.pid"
+        log "Whisper daemon ready"
+    else
+        log "Whisper daemon already running"
+    fi
 
-    # Find the sox PID within the pipeline for the stop script
-    sleep 0.2
-    SOX_PID=$(pgrep -P "$LOOP_PID" -f "sox" 2>/dev/null | head -1 || true)
-    [ -n "$SOX_PID" ] && echo "$SOX_PID" > "$DIR/rec.pid"
+    # Start recording — sox writes raw PCM to the FIFO.
+    # The daemon blocks on FIFO open until this writer connects.
+    sox -q -d -c "$SOX_CHANNELS" -r "$SOX_RATE" -b "$SOX_BITS" -e signed-integer \
+        -t raw "$DIR/audio.fifo" 2>>"$LOG_FILE" &
+    SOX_PID=$!
+    echo "$SOX_PID" > "$DIR/rec.pid"
 
-    # Also store the worker PID
-    WORKER_PID=$(pgrep -P "$LOOP_PID" -f "hotmic_whisper_worker" 2>/dev/null | head -1 || true)
-    [ -n "$WORKER_PID" ] && echo "$WORKER_PID" > "$DIR/whisper_worker.pid"
-
-    log "Dictation started (pipeline PID $LOOP_PID)"
+    log "Dictation started (sox PID $SOX_PID)"
     log "Ready"
     exit 0
 fi

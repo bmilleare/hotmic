@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Continuous audio reader, splitter, and transcriber.
+Persistent whisper daemon for hotmic.
 
-Sox pipes raw PCM into stdin. This process:
-1. Immediately starts reading audio (keeps the pipe drained)
-2. Loads the whisper model in the background
-3. Splits audio on silence or max duration
-4. Transcribes each chunk in a background thread
-5. Types results into the active window via xdotool
+Loads the model ONCE, then loops accepting audio sessions via a FIFO:
+1. Opens FIFO for reading (blocks until sox connects)
+2. Reads PCM audio, splits on silence or max duration
+3. Transcribes each chunk and types into the saved target window
+4. When sox dies (EOF on FIFO), transcribes remaining audio
+5. Goes back to step 1 — model stays loaded in GPU memory
+
+This eliminates the ~26s model reload penalty on every dictation session.
 """
 
 import os
@@ -26,6 +28,8 @@ DIR = "/tmp/hotmic"
 READY_FILE = f"{DIR}/whisper.ready"
 LOG_FILE = f"{DIR}/hotmic.log"
 CHUNK_DIR = f"{DIR}/chunks"
+FIFO_PATH = f"{DIR}/audio.fifo"
+WINDOW_FILE = f"{DIR}/window_id"
 
 # Audio format (must match sox output)
 RATE = 16000
@@ -47,7 +51,7 @@ MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 def log(msg):
     from datetime import datetime
     with open(LOG_FILE, "a") as f:
-        f.write(f"[{datetime.now().strftime('%H:%M:%S')}] whisper-worker: {msg}\n")
+        f.write(f"[{datetime.now().strftime('%H:%M:%S')}] whisper-daemon: {msg}\n")
 
 
 def rms(samples):
@@ -68,22 +72,29 @@ def samples_to_wav(raw_samples, path):
         wf.writeframes(data)
 
 
-def reader_loop(chunk_queue, stop_event):
-    """Read continuous PCM from stdin and split into chunks. Runs immediately."""
+def get_target_window():
+    """Read the saved window ID to type into."""
+    try:
+        with open(WINDOW_FILE) as f:
+            wid = f.read().strip()
+            return wid if wid else None
+    except OSError:
+        return None
+
+
+def reader_loop(audio_input, chunk_queue, session_stop):
+    """Read continuous PCM from audio_input and split into chunks."""
     chunk_num = 0
     audio_buf = []
     silent_blocks = 0
     has_speech = False
     max_samples = MAX_CHUNK_SEC * RATE
 
-    log(f"reading audio (max_chunk={MAX_CHUNK_SEC}s, silence_dur={SILENCE_DUR}s, silence_thresh={SILENCE_THRESH})")
-
-    stdin = sys.stdin.buffer
     try:
-        while not stop_event.is_set():
-            raw = stdin.read(BLOCK_BYTES)
+        while not session_stop.is_set():
+            raw = audio_input.read(BLOCK_BYTES)
             if not raw:
-                break  # sox closed pipe (recording stopped)
+                break  # EOF — sox closed the FIFO
 
             # Decode PCM samples
             n_samples = len(raw) // SAMPWIDTH
@@ -130,29 +141,23 @@ def reader_loop(chunk_queue, stop_event):
     log("reader finished")
 
 
-def transcriber_loop(model_holder, chunk_queue, stop_event):
-    """Background thread: waits for model, then transcribes chunks and types results."""
-    # Wait for model to be loaded.
-    # Don't bail on stop_event if chunks are pending — a short recording may
-    # stop before the model finishes loading, but we still need to transcribe.
-    deadline = time.monotonic() + 60  # absolute max wait for model
+def transcriber_loop(model_holder, chunk_queue, session_stop, window_id):
+    """Transcribe chunks and type results into the target window."""
+    # Wait for model if still loading (first session may start before model is ready)
+    deadline = time.monotonic() + 120
     while not model_holder:
-        if stop_event.is_set() and not chunk_queue:
+        if session_stop.is_set() and not chunk_queue:
             return  # stopped with nothing to transcribe
         if time.monotonic() > deadline:
-            log("model load timeout, giving up")
+            log("model load timeout, giving up on session")
             return
         time.sleep(0.1)
 
-    if not model_holder:
-        return
-
     model = model_holder[0]
-    log("transcriber ready")
 
-    while not stop_event.is_set() or chunk_queue:
+    while not session_stop.is_set() or chunk_queue:
         if not chunk_queue:
-            stop_event.wait(0.05)
+            session_stop.wait(0.05)
             continue
 
         chunk_path, chunk_num = chunk_queue.popleft()
@@ -186,10 +191,11 @@ def transcriber_loop(model_holder, chunk_queue, stop_event):
 
         log(f"transcribed: {text}")
         try:
-            subprocess.run(
-                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text + " "],
-                timeout=5,
-            )
+            cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "0"]
+            if window_id:
+                cmd.extend(["--window", window_id])
+            cmd.extend(["--", text + " "])
+            subprocess.run(cmd, timeout=5)
         except Exception as e:
             log(f"xdotool error: {e}")
 
@@ -201,27 +207,24 @@ def main():
 
     os.makedirs(CHUNK_DIR, exist_ok=True)
 
+    # Create FIFO
+    if os.path.exists(FIFO_PATH) and not stat_is_fifo(FIFO_PATH):
+        os.remove(FIFO_PATH)
+    if not os.path.exists(FIFO_PATH):
+        os.mkfifo(FIFO_PATH)
+
     # Graceful shutdown
-    stop_event = Event()
+    daemon_stop = Event()
     def handle_signal(signum, frame):
-        stop_event.set()
+        daemon_stop.set()
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    # Shared model holder (list so transcriber thread can see when it's loaded)
+    # Model holder — shared between sessions, populated by loader thread
     model_holder = []
-    chunk_queue = deque()
 
-    # Start reader thread IMMEDIATELY — keeps the pipe drained while model loads
-    reader = Thread(target=reader_loop, args=(chunk_queue, stop_event), daemon=True)
-    reader.start()
-
-    # Start transcriber thread (waits for model internally)
-    transcriber = Thread(target=transcriber_loop, args=(model_holder, chunk_queue, stop_event), daemon=True)
-    transcriber.start()
-
-    # Load model in a background thread so the main thread isn't blocked in
-    # a C extension call (which can't be interrupted by signals or timeouts).
+    # Load model in a background thread so the daemon can accept audio immediately.
+    # The first session's transcriber waits for the model; subsequent sessions have it ready.
     def load_model():
         try:
             log(f"loading model={model_name} device={device} compute_type={compute_type}")
@@ -246,35 +249,72 @@ def main():
     loader = Thread(target=load_model, daemon=True)
     loader.start()
 
-    # Wait for model to load (up to 45s)
-    loader.join(timeout=45)
-    if not model_holder:
-        log("FATAL: model load timed out or failed")
-        stop_event.set()
-        sys.exit(1)
-
-    # Signal readiness
+    # Signal readiness — FIFO exists, daemon is accepting sessions.
+    # Model may still be loading; the transcriber waits for it.
     open(READY_FILE, "w").close()
+    log("daemon ready, accepting audio (model loading in background)")
 
-    # Wait for reader to finish (pipe closed = sox died or was killed).
-    # Reader may already be done if the user stopped during model loading.
-    reader.join()
+    # === Main session loop ===
+    while not daemon_stop.is_set():
+        # Open FIFO for reading — blocks until sox opens it for writing
+        try:
+            fifo = open(FIFO_PATH, "rb")
+        except OSError as e:
+            if daemon_stop.is_set():
+                break
+            log(f"FIFO open error: {e}")
+            time.sleep(0.5)
+            continue
 
-    # Wait for transcriber to drain remaining chunks before signalling stop.
-    drain_deadline = time.monotonic() + 30
-    while chunk_queue and time.monotonic() < drain_deadline:
-        time.sleep(0.1)
+        window_id = get_target_window()
+        log(f"session started (target window: {window_id or 'active'})")
 
-    log("waiting for transcription to complete...")
-    stop_event.set()
-    transcriber.join(timeout=15)
+        chunk_queue = deque()
+        session_stop = Event()
+
+        reader = Thread(target=reader_loop, args=(fifo, chunk_queue, session_stop))
+        reader.start()
+
+        transcriber = Thread(target=transcriber_loop, args=(model_holder, chunk_queue, session_stop, window_id))
+        transcriber.start()
+
+        # Wait for reader to finish (EOF = sox died / was killed)
+        reader.join()
+
+        # Wait for transcriber to drain remaining chunks
+        drain_deadline = time.monotonic() + 30
+        while chunk_queue and time.monotonic() < drain_deadline:
+            time.sleep(0.1)
+
+        session_stop.set()
+        transcriber.join(timeout=15)
+
+        try:
+            fifo.close()
+        except OSError:
+            pass
+
+        log("session complete")
 
     # Cleanup
     try:
         os.remove(READY_FILE)
     except OSError:
         pass
-    log("worker exiting")
+    try:
+        os.remove(FIFO_PATH)
+    except OSError:
+        pass
+    log("daemon exiting")
+
+
+def stat_is_fifo(path):
+    """Check if path is a FIFO."""
+    import stat
+    try:
+        return stat.S_ISFIFO(os.stat(path).st_mode)
+    except OSError:
+        return False
 
 
 if __name__ == "__main__":
