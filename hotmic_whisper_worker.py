@@ -16,6 +16,7 @@ import wave
 import struct
 import signal
 import math
+import time
 import subprocess
 import traceback
 from collections import deque
@@ -131,9 +132,17 @@ def reader_loop(chunk_queue, stop_event):
 
 def transcriber_loop(model_holder, chunk_queue, stop_event):
     """Background thread: waits for model, then transcribes chunks and types results."""
-    # Wait for model to be loaded
-    while not model_holder and not stop_event.is_set():
-        stop_event.wait(0.1)
+    # Wait for model to be loaded.
+    # Don't bail on stop_event if chunks are pending — a short recording may
+    # stop before the model finishes loading, but we still need to transcribe.
+    deadline = time.monotonic() + 60  # absolute max wait for model
+    while not model_holder:
+        if stop_event.is_set() and not chunk_queue:
+            return  # stopped with nothing to transcribe
+        if time.monotonic() > deadline:
+            log("model load timeout, giving up")
+            return
+        time.sleep(0.1)
 
     if not model_holder:
         return
@@ -211,41 +220,54 @@ def main():
     transcriber = Thread(target=transcriber_loop, args=(model_holder, chunk_queue, stop_event), daemon=True)
     transcriber.start()
 
-    # Load model on main thread (slow, but reader is already draining the pipe)
-    try:
-        log(f"loading model={model_name} device={device} compute_type={compute_type}")
-        from faster_whisper import WhisperModel
-        model = WhisperModel(model_name, device=device, compute_type=compute_type)
-        model_holder.append(model)
-        log("model loaded, ready for chunks")
-    except Exception as e:
-        if device != "cpu":
-            log(f"CUDA failed ({e}), falling back to CPU")
-            try:
-                model = WhisperModel(model_name, device="cpu", compute_type="float32")
-                model_holder.append(model)
-                log("model loaded on CPU, ready for chunks")
-            except Exception as e2:
-                log(f"FATAL: failed to load model on CPU: {e2}")
+    # Load model in a background thread so the main thread isn't blocked in
+    # a C extension call (which can't be interrupted by signals or timeouts).
+    def load_model():
+        try:
+            log(f"loading model={model_name} device={device} compute_type={compute_type}")
+            from faster_whisper import WhisperModel
+            m = WhisperModel(model_name, device=device, compute_type=compute_type)
+            model_holder.append(m)
+            log("model loaded, ready for chunks")
+        except Exception as e:
+            if device != "cpu":
+                log(f"CUDA failed ({e}), falling back to CPU")
+                try:
+                    m = WhisperModel(model_name, device="cpu", compute_type="float32")
+                    model_holder.append(m)
+                    log("model loaded on CPU, ready for chunks")
+                except Exception as e2:
+                    log(f"FATAL: failed to load model: {e2}")
+                    traceback.print_exc(file=open(LOG_FILE, "a"))
+            else:
+                log(f"FATAL: failed to load model: {e}")
                 traceback.print_exc(file=open(LOG_FILE, "a"))
-                stop_event.set()
-                sys.exit(1)
-        else:
-            log(f"FATAL: failed to load model: {e}")
-            traceback.print_exc(file=open(LOG_FILE, "a"))
-            stop_event.set()
-            sys.exit(1)
+
+    loader = Thread(target=load_model, daemon=True)
+    loader.start()
+
+    # Wait for model to load (up to 45s)
+    loader.join(timeout=45)
+    if not model_holder:
+        log("FATAL: model load timed out or failed")
+        stop_event.set()
+        sys.exit(1)
 
     # Signal readiness
     open(READY_FILE, "w").close()
 
-    # Wait for reader to finish (pipe closed = sox died or was killed)
+    # Wait for reader to finish (pipe closed = sox died or was killed).
+    # Reader may already be done if the user stopped during model loading.
     reader.join()
 
-    # Give transcriber time to process remaining chunks
+    # Wait for transcriber to drain remaining chunks before signalling stop.
+    drain_deadline = time.monotonic() + 30
+    while chunk_queue and time.monotonic() < drain_deadline:
+        time.sleep(0.1)
+
     log("waiting for transcription to complete...")
     stop_event.set()
-    transcriber.join(timeout=30)
+    transcriber.join(timeout=15)
 
     # Cleanup
     try:

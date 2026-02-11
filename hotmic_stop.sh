@@ -16,12 +16,17 @@ kill_pid_file() {
 rm -f "$DIR/active"
 
 # Kill sox immediately so the mic stops.
-# For whisper backend: this closes the pipe, which triggers the worker to
-# flush remaining audio, transcribe it, and exit cleanly.
+# This closes the pipe → worker gets EOF → reader finishes.
+# The worker continues running to load the model (if still loading)
+# and transcribe remaining chunks, then exits on its own.
 kill_pid_file "$DIR/rec.pid"
 
 # Kill the indicator immediately (visual feedback that we stopped)
 kill_pid_file "$DIR/indicator.pid"
+
+# NOTE: We intentionally do NOT kill the whisper worker here.
+# It needs time to finish model loading and transcribe the final audio.
+# Stale workers are cleaned up by the start script when beginning a new session.
 
 if [ -f "$DIR/hotmic.log" ]; then
     echo "[$(date '+%H:%M:%S')] Dictation stopped" >> "$DIR/hotmic.log"

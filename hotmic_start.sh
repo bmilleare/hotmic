@@ -71,8 +71,13 @@ log "Indicator PID $(cat "$DIR/indicator.pid")"
 # WHISPER BACKEND: continuous sox → pipe → Python worker (split + transcribe)
 # ===========================================================================
 if [ "$HOTMIC_BACKEND" = "whisper" ]; then
-    # Kill any orphaned workers from previous sessions
-    pkill -f "hotmic_whisper_worker" 2>/dev/null || true
+    # Kill any orphaned workers aggressively (SIGKILL) to ensure GPU memory is freed.
+    # A worker killed mid-model-load can leave CUDA in a dirty state, causing the
+    # next worker's model load to hang indefinitely.
+    if pgrep -f "hotmic_whisper_worker" >/dev/null 2>&1; then
+        pkill -9 -f "hotmic_whisper_worker" 2>/dev/null || true
+        sleep 1  # allow GPU memory to be reclaimed by the kernel
+    fi
 
     # Resolve NVIDIA library paths for CTranslate2
     NVIDIA_LIB_DIR="$(python3 -c 'import nvidia.cublas.lib; print(nvidia.cublas.lib.__path__[0])' 2>/dev/null || true)"
