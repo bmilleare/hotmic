@@ -12,6 +12,7 @@ Loads the model ONCE, then loops accepting audio sessions via a FIFO:
 This eliminates the ~26s model reload penalty on every dictation session.
 """
 
+import gc
 import os
 import sys
 import wave
@@ -46,6 +47,9 @@ BLOCK_SAMPLES = int(RATE * 0.05)  # 50ms blocks
 BLOCK_BYTES = BLOCK_SAMPLES * SAMPWIDTH
 SILENCE_BLOCKS = int(SILENCE_DUR / 0.05)  # blocks of silence needed to split
 MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
+
+# Idle timeout: unload model from GPU after this many seconds of no use
+MODEL_IDLE_SEC = int(os.environ.get("MODEL_IDLE_SEC", "300"))  # default 5 min
 
 
 def log(msg):
@@ -230,12 +234,16 @@ def main():
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
 
-    # Model holder — shared between sessions, populated by loader thread
+    # Model holder — shared between sessions, populated by loader thread.
+    # Using a list so threads can see when it's loaded/unloaded.
     model_holder = []
+    model_loading = Event()  # set while a load is in progress
 
-    # Load model in a background thread so the daemon can accept audio immediately.
-    # The first session's transcriber waits for the model; subsequent sessions have it ready.
     def load_model():
+        """Load whisper model into GPU (or CPU fallback)."""
+        if model_holder or model_loading.is_set():
+            return
+        model_loading.set()
         try:
             log(f"loading model={model_name} device={device} compute_type={compute_type}")
             from faster_whisper import WhisperModel
@@ -255,14 +263,41 @@ def main():
             else:
                 log(f"FATAL: failed to load model: {e}")
                 traceback.print_exc(file=open(LOG_FILE, "a"))
+        finally:
+            model_loading.clear()
 
+    def unload_model():
+        """Unload model to free GPU memory."""
+        if not model_holder:
+            return
+        model_holder.clear()
+        gc.collect()
+        log("model unloaded, GPU memory freed")
+
+    # Track last session time for idle timeout
+    last_session_end = [time.monotonic()]
+
+    # Watchdog thread: unloads model after MODEL_IDLE_SEC of inactivity
+    def idle_watchdog():
+        while not daemon_stop.is_set():
+            daemon_stop.wait(30)  # check every 30s
+            if model_holder and not model_loading.is_set():
+                idle = time.monotonic() - last_session_end[0]
+                if idle > MODEL_IDLE_SEC:
+                    log(f"idle for {int(idle)}s, unloading model to free GPU memory")
+                    unload_model()
+
+    watchdog = Thread(target=idle_watchdog, daemon=True)
+    watchdog.start()
+
+    # Load model in background — first session starts recording immediately
     loader = Thread(target=load_model, daemon=True)
     loader.start()
 
     # Signal readiness — FIFO exists, daemon is accepting sessions.
     # Model may still be loading; the transcriber waits for it.
     open(READY_FILE, "w").close()
-    log("daemon ready, accepting audio (model loading in background)")
+    log(f"daemon ready, accepting audio (idle timeout: {MODEL_IDLE_SEC}s)")
 
     # === Main session loop ===
     while not daemon_stop.is_set():
@@ -275,6 +310,12 @@ def main():
             log(f"FIFO open error: {e}")
             time.sleep(0.5)
             continue
+
+        # Reload model if it was unloaded due to idle timeout
+        if not model_holder and not model_loading.is_set():
+            log("model was unloaded, reloading for new session...")
+            loader = Thread(target=load_model, daemon=True)
+            loader.start()
 
         window_id = get_target_window()
         log(f"session started (target window: {window_id or 'active'})")
@@ -304,6 +345,7 @@ def main():
         except OSError:
             pass
 
+        last_session_end[0] = time.monotonic()
         log("session complete")
 
     # Cleanup
