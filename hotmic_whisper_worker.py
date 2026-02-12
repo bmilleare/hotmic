@@ -191,11 +191,19 @@ def transcriber_loop(model_holder, chunk_queue, session_stop, window_id):
 
         log(f"transcribed: {text}")
         try:
-            cmd = ["xdotool", "type", "--clearmodifiers", "--delay", "0"]
             if window_id:
-                cmd.extend(["--window", window_id])
-            cmd.extend(["--", text + " "])
-            subprocess.run(cmd, timeout=5)
+                # Briefly focus the target window, type, then let the user's
+                # current window naturally retain focus. windowactivate is more
+                # reliable than --window (which sends synthetic events many
+                # apps ignore).
+                subprocess.run(
+                    ["xdotool", "windowactivate", "--sync", window_id],
+                    timeout=2,
+                )
+            subprocess.run(
+                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text + " "],
+                timeout=5,
+            )
         except Exception as e:
             log(f"xdotool error: {e}")
 
