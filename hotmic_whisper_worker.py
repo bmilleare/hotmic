@@ -131,8 +131,10 @@ def reader_loop(audio_input, chunk_queue, session_stop):
     except Exception as e:
         log(f"reader error: {e}")
 
-    # Flush remaining audio
-    if audio_buf and has_speech and len(audio_buf) >= MIN_CHUNK_SAMPLES:
+    # Flush remaining audio — always flush at session end if we have enough
+    # samples. The user explicitly stopped, so transcribe whatever's left.
+    # (Whisper returns empty text for silence, which we skip anyway.)
+    if audio_buf and len(audio_buf) >= MIN_CHUNK_SAMPLES:
         chunk_path = os.path.join(CHUNK_DIR, f"chunk_{chunk_num}.wav")
         samples_to_wav(audio_buf, chunk_path)
         log(f"final chunk {chunk_num}: {len(audio_buf)} samples ({len(audio_buf)/RATE:.1f}s) → queue")
