@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="hotmic.png" alt="hotmic" width="200">
+  <img src="hotmic.png" alt="hotmic" width="500">
 </p>
 
 # hotmic
