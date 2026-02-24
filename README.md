@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="hotmic.png" alt="hotmic" width="200">
+</p>
+
 # hotmic
 
 Speech-to-text dictation for Linux. Speak into your microphone and text appears in whatever window has focus.
