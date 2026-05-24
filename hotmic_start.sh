@@ -78,7 +78,15 @@ if [ "$HOTMIC_BACKEND" = "whisper" ]; then
     # even if focus changes during transcription
     xdotool getactivewindow > "$DIR/window_id" 2>/dev/null || true
 
-    # Start daemon if not already running
+    # Start daemon if not already running. Also start fresh if a daemon
+    # process exists but its ready file is gone (mid-shutdown from the
+    # idle-restart watchdog) — avoids racing with a dying daemon.
+    if pgrep -f "hotmic_whisper_worker" >/dev/null 2>&1 && [ ! -f "$DIR/whisper.ready" ]; then
+        log "Stale daemon detected (no ready file), killing before restart..."
+        pkill -9 -f "hotmic_whisper_worker" 2>/dev/null || true
+        rm -f "$DIR/audio.fifo" "$DIR/whisper_worker.pid"
+        sleep 0.3
+    fi
     if ! pgrep -f "hotmic_whisper_worker" >/dev/null 2>&1; then
         log "Starting whisper daemon..."
 

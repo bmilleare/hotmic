@@ -50,6 +50,10 @@ MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 
 # Idle timeout: unload model from GPU after this many seconds of no use
 MODEL_IDLE_SEC = int(os.environ.get("MODEL_IDLE_SEC", "300"))  # default 5 min
+# Idle restart: exit daemon entirely after this many seconds of no use, so the
+# next session spawns a fresh process. Works around state that accumulates over
+# long-lived daemons (X server / xdotool quirks causing dropped keystrokes).
+RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "1800"))  # default 30 min
 
 
 def log(msg):
@@ -277,15 +281,28 @@ def main():
     # Track last session time for idle timeout
     last_session_end = [time.monotonic()]
 
-    # Watchdog thread: unloads model after MODEL_IDLE_SEC of inactivity
+    # Watchdog thread: unloads model after MODEL_IDLE_SEC of inactivity,
+    # then exits the daemon entirely after RESTART_IDLE_SEC to clear any
+    # accumulated state (e.g. X server quirks that drop keystrokes).
     def idle_watchdog():
         while not daemon_stop.is_set():
             daemon_stop.wait(30)  # check every 30s
-            if model_holder and not model_loading.is_set():
-                idle = time.monotonic() - last_session_end[0]
-                if idle > MODEL_IDLE_SEC:
-                    log(f"idle for {int(idle)}s, unloading model to free GPU memory")
-                    unload_model()
+            if daemon_stop.is_set():
+                return
+            idle = time.monotonic() - last_session_end[0]
+            if model_holder and not model_loading.is_set() and idle > MODEL_IDLE_SEC:
+                log(f"idle for {int(idle)}s, unloading model to free GPU memory")
+                unload_model()
+            if idle > RESTART_IDLE_SEC:
+                log(f"idle for {int(idle)}s, exiting daemon for fresh restart on next session")
+                # Drop the ready file first so hotmic_start.sh won't try to
+                # reuse this dying daemon.
+                try:
+                    os.remove(READY_FILE)
+                except OSError:
+                    pass
+                os.kill(os.getpid(), signal.SIGTERM)
+                return
 
     watchdog = Thread(target=idle_watchdog, daemon=True)
     watchdog.start()
@@ -297,7 +314,7 @@ def main():
     # Signal readiness — FIFO exists, daemon is accepting sessions.
     # Model may still be loading; the transcriber waits for it.
     open(READY_FILE, "w").close()
-    log(f"daemon ready, accepting audio (idle timeout: {MODEL_IDLE_SEC}s)")
+    log(f"daemon ready, accepting audio (model idle: {MODEL_IDLE_SEC}s, restart idle: {RESTART_IDLE_SEC}s)")
 
     # === Main session loop ===
     while not daemon_stop.is_set():
