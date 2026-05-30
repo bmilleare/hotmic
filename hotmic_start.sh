@@ -90,6 +90,12 @@ if [ "$HOTMIC_BACKEND" = "whisper" ]; then
     if ! pgrep -f "hotmic_whisper_worker" >/dev/null 2>&1; then
         log "Starting whisper daemon..."
 
+        # No daemon is running, so any leftover ready/FIFO/pid files are stale
+        # state from a crashed or OOM-killed daemon (SIGKILL skips cleanup).
+        # Clear them so the readiness wait below genuinely waits for the NEW
+        # daemon instead of being satisfied instantly by a dead daemon's file.
+        rm -f "$DIR/whisper.ready" "$DIR/audio.fifo" "$DIR/whisper_worker.pid"
+
         # Resolve NVIDIA library paths for CTranslate2
         NVIDIA_LIB_DIR="$(python3 -c 'import nvidia.cublas.lib; print(nvidia.cublas.lib.__path__[0])' 2>/dev/null || true)"
         CUDNN_LIB_DIR="$(python3 -c 'import nvidia.cudnn.lib; print(nvidia.cudnn.lib.__path__[0])' 2>/dev/null || true)"
