@@ -204,8 +204,12 @@ def transcriber_loop(model_holder, chunk_queue, session_stop, window_id):
             except OSError:
                 pass
 
-        if not text:
-            log("empty transcription, skipping")
+        # Skip empty or non-speech transcriptions. Whisper emits punctuation-only
+        # noise ("." / ".." / "..." / ". .") for silence and breaths; typing that
+        # is worse than nothing. Requiring at least one alphanumeric character
+        # drops the noise without risking real short words ("you", "ok", "no").
+        if not any(c.isalnum() for c in text):
+            log(f"skipping non-speech transcription: {text!r}")
             continue
 
         log(f"transcribed: {text}")
