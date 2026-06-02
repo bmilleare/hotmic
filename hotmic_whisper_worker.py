@@ -25,7 +25,12 @@ import traceback
 from collections import deque
 from threading import Thread, Event
 
-DIR = "/tmp/hotmic"
+DIR = os.environ.get("HOTMIC_DIR", "/tmp/hotmic")  # overridable for isolated tests
+# Created by hotmic_start.sh before it launches sox, removed by hotmic_stop.sh —
+# present for the whole dictation lifecycle. The watchdog uses it to avoid
+# re-exec'ing the daemon while a session is starting (sox connected but audio not
+# yet flowing — a state the FIFO itself can't distinguish from idle).
+STATE_FILE = f"{DIR}/active"
 READY_FILE = f"{DIR}/whisper.ready"
 LOG_FILE = f"{DIR}/hotmic.log"
 CHUNK_DIR = f"{DIR}/chunks"
@@ -50,10 +55,14 @@ MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 
 # Idle timeout: unload model from GPU after this many seconds of no use
 MODEL_IDLE_SEC = int(os.environ.get("MODEL_IDLE_SEC", "300"))  # default 5 min
-# Idle restart: exit daemon entirely after this many seconds of no use, so the
-# next session spawns a fresh process. Works around state that accumulates over
-# long-lived daemons (X server / xdotool quirks causing dropped keystrokes).
-RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "1800"))  # default 30 min
+# Idle restart: re-exec the daemon after this many seconds of no use. A full
+# process restart clears accumulated X/xdotool state (dropped keystrokes) AND
+# reclaims the multi-GB host RAM pooled by CTranslate2/CUDA. It runs DURING idle
+# and keeps the daemon resident+ready, so the next session still hits the warm
+# path — no cold-spawn gap that would drop the start of dictation.
+RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "3600"))  # default 60 min
+# How often the watchdog re-checks idle time (lower only for tests).
+WATCHDOG_INTERVAL_SEC = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "30"))
 
 
 def log(msg):
@@ -280,45 +289,71 @@ def main():
 
     # Track last session time for idle timeout
     last_session_end = [time.monotonic()]
+    # Set while a dictation session is active, so the watchdog never unloads the
+    # model or re-execs the process underneath a running session.
+    in_session = Event()
 
-    # Watchdog thread: unloads model after MODEL_IDLE_SEC of inactivity,
-    # then exits the daemon entirely after RESTART_IDLE_SEC to clear any
-    # accumulated state (e.g. X server quirks that drop keystrokes).
+    # A dictation is active (or starting) if either the in_session flag is set OR
+    # start.sh's STATE_FILE exists. The STATE_FILE is the authoritative signal: it
+    # is created before sox launches and removed on stop, so it covers the window
+    # where sox has connected but in_session isn't set yet — a state the FIFO
+    # cannot distinguish from idle.
+    def dictation_active():
+        return in_session.is_set() or os.path.exists(STATE_FILE)
+
+    # Watchdog thread: unloads the model after MODEL_IDLE_SEC to free GPU memory,
+    # then re-execs the whole process after RESTART_IDLE_SEC. The re-exec (replacing
+    # the old SIGTERM, which the main thread — blocked in open(FIFO) — never
+    # observed, so the process just lingered and the NEXT keypress paid a cold-spawn
+    # gap that ate the start of dictation) runs DURING idle: it clears accumulated
+    # X/xdotool state, reclaims the multi-GB host RAM pooled by CTranslate2/CUDA,
+    # and re-runs main() fresh while keeping the daemon resident + ready, so the
+    # next session still hits the warm path. It never fires while a dictation is
+    # active or starting (dictation_active guard, re-checked just before execv).
     def idle_watchdog():
         while not daemon_stop.is_set():
-            daemon_stop.wait(30)  # check every 30s
+            daemon_stop.wait(WATCHDOG_INTERVAL_SEC)
             if daemon_stop.is_set():
                 return
+            if dictation_active():
+                continue  # never unload or restart during/just before a session
             idle = time.monotonic() - last_session_end[0]
             if model_holder and not model_loading.is_set() and idle > MODEL_IDLE_SEC:
                 log(f"idle for {int(idle)}s, unloading model to free GPU memory")
                 unload_model()
             if idle > RESTART_IDLE_SEC:
-                log(f"idle for {int(idle)}s, exiting daemon for fresh restart on next session")
-                # Drop the ready file first so hotmic_start.sh won't try to
-                # reuse this dying daemon.
-                try:
-                    os.remove(READY_FILE)
-                except OSError:
-                    pass
-                os.kill(os.getpid(), signal.SIGTERM)
-                return
+                # Re-check immediately before execv to close the tiny window
+                # against a session starting since the guard above.
+                if dictation_active():
+                    continue
+                log(f"idle for {int(idle)}s, re-exec for fresh process "
+                    f"(clears state, reclaims RAM; daemon stays resident + ready)")
+                # Keep whisper.ready and the FIFO in place so start.sh keeps seeing
+                # a ready resident daemon (warm path). execv replaces this entire
+                # process image — including the main thread blocked in open(FIFO) —
+                # and re-runs main() fresh, inheriting the current environment
+                # (LD_LIBRARY_PATH, WHISPER_*, MAX_CHUNK_SEC, ...).
+                os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
+                return  # unreachable if execv succeeds
 
     watchdog = Thread(target=idle_watchdog, daemon=True)
     watchdog.start()
 
-    # Load model in background — first session starts recording immediately
-    loader = Thread(target=load_model, daemon=True)
-    loader.start()
+    # Model is loaded LAZILY on the first session (see the load path in the
+    # session loop below), not eagerly here. This keeps an idle or just-re-exec'd
+    # daemon at ~150 MB RSS instead of holding the model's multi-GB host
+    # allocation while nobody is dictating; the reader buffers audio while the
+    # model loads on demand, so the start of speech is still captured.
 
     # Signal readiness — FIFO exists, daemon is accepting sessions.
-    # Model may still be loading; the transcriber waits for it.
+    # The model loads on the first session; the transcriber waits for it.
     open(READY_FILE, "w").close()
     log(f"daemon ready, accepting audio (model idle: {MODEL_IDLE_SEC}s, restart idle: {RESTART_IDLE_SEC}s)")
 
     # === Main session loop ===
     while not daemon_stop.is_set():
-        # Open FIFO for reading — blocks until sox opens it for writing
+        # Open FIFO for reading — blocks until sox opens it for writing. While
+        # blocked here the daemon is idle, so the watchdog may re-exec the process.
         try:
             fifo = open(FIFO_PATH, "rb")
         except OSError as e:
@@ -328,42 +363,51 @@ def main():
             time.sleep(0.5)
             continue
 
-        # Reload model if it was unloaded due to idle timeout
-        if not model_holder and not model_loading.is_set():
-            log("model was unloaded, reloading for new session...")
-            loader = Thread(target=load_model, daemon=True)
-            loader.start()
-
-        window_id = get_target_window()
-        log(f"session started (target window: {window_id or 'active'})")
-
-        chunk_queue = deque()
-        session_stop = Event()
-
-        reader = Thread(target=reader_loop, args=(fifo, chunk_queue, session_stop))
-        reader.start()
-
-        transcriber = Thread(target=transcriber_loop, args=(model_holder, chunk_queue, session_stop, window_id))
-        transcriber.start()
-
-        # Wait for reader to finish (EOF = sox died / was killed)
-        reader.join()
-
-        # Wait for transcriber to drain remaining chunks
-        drain_deadline = time.monotonic() + 30
-        while chunk_queue and time.monotonic() < drain_deadline:
-            time.sleep(0.1)
-
-        session_stop.set()
-        transcriber.join(timeout=15)
-
+        # A writer (sox) connected — mark the session active so the watchdog won't
+        # unload the model under us. The window between this open() returning and
+        # here was already guarded by start.sh's STATE_FILE.
+        in_session.set()
         try:
-            fifo.close()
-        except OSError:
-            pass
+            # Load the model if it isn't resident — the lazy first-load path and
+            # the reload-after-idle-unload path. The reader buffers audio while
+            # this runs in the background; the transcriber waits for it.
+            if not model_holder and not model_loading.is_set():
+                log("model not loaded, loading for new session...")
+                loader = Thread(target=load_model, daemon=True)
+                loader.start()
 
-        last_session_end[0] = time.monotonic()
-        log("session complete")
+            window_id = get_target_window()
+            log(f"session started (target window: {window_id or 'active'})")
+
+            chunk_queue = deque()
+            session_stop = Event()
+
+            reader = Thread(target=reader_loop, args=(fifo, chunk_queue, session_stop))
+            reader.start()
+
+            transcriber = Thread(target=transcriber_loop, args=(model_holder, chunk_queue, session_stop, window_id))
+            transcriber.start()
+
+            # Wait for reader to finish (EOF = sox died / was killed)
+            reader.join()
+
+            # Wait for transcriber to drain remaining chunks
+            drain_deadline = time.monotonic() + 30
+            while chunk_queue and time.monotonic() < drain_deadline:
+                time.sleep(0.1)
+
+            session_stop.set()
+            transcriber.join(timeout=15)
+
+            try:
+                fifo.close()
+            except OSError:
+                pass
+
+            last_session_end[0] = time.monotonic()
+            log("session complete")
+        finally:
+            in_session.clear()
 
     # Cleanup
     try:
