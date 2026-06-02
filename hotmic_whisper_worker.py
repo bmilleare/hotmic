@@ -12,7 +12,6 @@ Loads the model ONCE, then loops accepting audio sessions via a FIFO:
 This eliminates the ~26s model reload penalty on every dictation session.
 """
 
-import gc
 import os
 import sys
 import wave
@@ -53,14 +52,15 @@ BLOCK_BYTES = BLOCK_SAMPLES * SAMPWIDTH
 SILENCE_BLOCKS = int(SILENCE_DUR / 0.05)  # blocks of silence needed to split
 MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 
-# Idle timeout: unload model from GPU after this many seconds of no use
-MODEL_IDLE_SEC = int(os.environ.get("MODEL_IDLE_SEC", "300"))  # default 5 min
-# Idle restart: re-exec the daemon after this many seconds of no use. A full
-# process restart clears accumulated X/xdotool state (dropped keystrokes) AND
-# reclaims the multi-GB host RAM pooled by CTranslate2/CUDA. It runs DURING idle
-# and keeps the daemon resident+ready, so the next session still hits the warm
-# path — no cold-spawn gap that would drop the start of dictation.
-RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "3600"))  # default 60 min
+# Idle restart: after this many seconds with no dictation, re-exec the daemon.
+# A full process restart is the ONLY thing that reclaims the multi-GB host RAM
+# CTranslate2/CUDA pool up over transcriptions (~150 MB each) — model unload and
+# malloc_trim do NOT return it. It also frees the GPU and clears accumulated
+# X/xdotool state, and re-runs main() fresh while keeping the daemon resident +
+# ready so the next session still hits the warm path. Set to the old model-unload
+# interval (5 min): the model already reloaded after a gap this long, so re-exec
+# adds no extra latency — it just also frees the RAM the unload couldn't.
+RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "300"))  # default 5 min
 # How often the watchdog re-checks idle time (lower only for tests).
 WATCHDOG_INTERVAL_SEC = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "30"))
 
@@ -283,18 +283,10 @@ def main():
         finally:
             model_loading.clear()
 
-    def unload_model():
-        """Unload model to free GPU memory."""
-        if not model_holder:
-            return
-        model_holder.clear()
-        gc.collect()
-        log("model unloaded, GPU memory freed")
-
     # Track last session time for idle timeout
     last_session_end = [time.monotonic()]
-    # Set while a dictation session is active, so the watchdog never unloads the
-    # model or re-execs the process underneath a running session.
+    # Set while a dictation session is active, so the watchdog never re-execs the
+    # process underneath a running session.
     in_session = Event()
 
     # A dictation is active (or starting) if either the in_session flag is set OR
@@ -305,33 +297,33 @@ def main():
     def dictation_active():
         return in_session.is_set() or os.path.exists(STATE_FILE)
 
-    # Watchdog thread: unloads the model after MODEL_IDLE_SEC to free GPU memory,
-    # then re-execs the whole process after RESTART_IDLE_SEC. The re-exec (replacing
-    # the old SIGTERM, which the main thread — blocked in open(FIFO) — never
-    # observed, so the process just lingered and the NEXT keypress paid a cold-spawn
-    # gap that ate the start of dictation) runs DURING idle: it clears accumulated
-    # X/xdotool state, reclaims the multi-GB host RAM pooled by CTranslate2/CUDA,
-    # and re-runs main() fresh while keeping the daemon resident + ready, so the
-    # next session still hits the warm path. It never fires while a dictation is
-    # active or starting (dictation_active guard, re-checked just before execv).
+    # Watchdog thread: re-execs the whole process after RESTART_IDLE_SEC of
+    # inactivity. A full restart is the ONLY way to reclaim the multi-GB host RAM
+    # CTranslate2/CUDA pool up over transcriptions (model unload / malloc_trim
+    # don't return it); it also frees the GPU and clears accumulated X/xdotool
+    # state. It replaces the old SIGTERM (which the main thread — blocked in
+    # open(FIFO) — never observed, so the process just lingered and the NEXT
+    # keypress paid a cold-spawn gap that ate the start of dictation) and re-runs
+    # main() fresh while keeping the daemon resident + ready, so the next session
+    # still hits the warm path (the model reloads lazily, exactly as it did after
+    # the old idle model-unload — no extra latency). It never fires while a
+    # dictation is active or starting (dictation_active guard, re-checked just
+    # before execv).
     def idle_watchdog():
         while not daemon_stop.is_set():
             daemon_stop.wait(WATCHDOG_INTERVAL_SEC)
             if daemon_stop.is_set():
                 return
             if dictation_active():
-                continue  # never unload or restart during/just before a session
+                continue  # never restart during/just before a session
             idle = time.monotonic() - last_session_end[0]
-            if model_holder and not model_loading.is_set() and idle > MODEL_IDLE_SEC:
-                log(f"idle for {int(idle)}s, unloading model to free GPU memory")
-                unload_model()
             if idle > RESTART_IDLE_SEC:
                 # Re-check immediately before execv to close the tiny window
                 # against a session starting since the guard above.
                 if dictation_active():
                     continue
                 log(f"idle for {int(idle)}s, re-exec for fresh process "
-                    f"(clears state, reclaims RAM; daemon stays resident + ready)")
+                    f"(frees GPU + reclaims host RAM; daemon stays resident + ready)")
                 # Keep whisper.ready and the FIFO in place so start.sh keeps seeing
                 # a ready resident daemon (warm path). execv replaces this entire
                 # process image — including the main thread blocked in open(FIFO) —
@@ -352,7 +344,7 @@ def main():
     # Signal readiness — FIFO exists, daemon is accepting sessions.
     # The model loads on the first session; the transcriber waits for it.
     open(READY_FILE, "w").close()
-    log(f"daemon ready, accepting audio (model idle: {MODEL_IDLE_SEC}s, restart idle: {RESTART_IDLE_SEC}s)")
+    log(f"daemon ready, accepting audio (idle restart: {RESTART_IDLE_SEC}s)")
 
     # === Main session loop ===
     while not daemon_stop.is_set():
