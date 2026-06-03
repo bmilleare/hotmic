@@ -57,10 +57,12 @@ MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 # CTranslate2/CUDA pool up over transcriptions (~150 MB each) — model unload and
 # malloc_trim do NOT return it. It also frees the GPU and clears accumulated
 # X/xdotool state, and re-runs main() fresh while keeping the daemon resident +
-# ready so the next session still hits the warm path. Set to the old model-unload
-# interval (5 min): the model already reloaded after a gap this long, so re-exec
-# adds no extra latency — it just also frees the RAM the unload couldn't.
-RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "300"))  # default 5 min
+# ready so the next session still hits the warm path. Set to 20 min: re-exec drops
+# the resident model, so a recording inside this window hits the warm (model-loaded)
+# path with no reload latency. 5 min was too short — normal gaps between dictations
+# regularly exceeded it, so the next recording paid a cold model reload. Longer
+# window trades held host RAM for fewer reloads.
+RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "1200"))  # default 20 min
 # How often the watchdog re-checks idle time (lower only for tests).
 WATCHDOG_INTERVAL_SEC = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "30"))
 
@@ -304,9 +306,9 @@ def main():
     # state. It replaces the old SIGTERM (which the main thread — blocked in
     # open(FIFO) — never observed, so the process just lingered and the NEXT
     # keypress paid a cold-spawn gap that ate the start of dictation) and re-runs
-    # main() fresh while keeping the daemon resident + ready, so the next session
-    # still hits the warm path (the model reloads lazily, exactly as it did after
-    # the old idle model-unload — no extra latency). It never fires while a
+    # main() fresh while keeping the daemon resident + ready. A recording inside the
+    # RESTART_IDLE_SEC window still hits the warm path; only one landing after the
+    # re-exec pays a lazy model reload. It never fires while a
     # dictation is active or starting (dictation_active guard, re-checked just
     # before execv).
     def idle_watchdog():
