@@ -58,7 +58,7 @@ MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 # always-live stream — no startup gap, and we keep audio from just before the
 # keypress. See docs/superpowers/specs/2026-06-04-continuous-capture-ring-buffer.
 RING_SECONDS = float(os.environ.get("RING_SECONDS", "10"))
-LOOKBACK_SEC = float(os.environ.get("LOOKBACK_SEC", "2.0"))
+LOOKBACK_SEC = float(os.environ.get("LOOKBACK_SEC", "0.5"))
 RING_BLOCKS = max(1, int(RING_SECONDS / 0.05))  # 50ms blocks -> 200 for 10s
 CONTROL_FIFO = f"{DIR}/control.fifo"
 PAUSED_FLAG = f"{DIR}/paused"

@@ -79,7 +79,7 @@ external writers never block) and reads newline-delimited commands:
 
 **Session start (START).** Record `t_start = monotonic()`. **In one locked
 critical section** (the same lock the capture thread uses): snapshot from the ring
-buffer every block with `ts >= t_start − LOOKBACK_SEC` (default **2.0 s**) to seed
+buffer every block with `ts >= t_start − LOOKBACK_SEC` (default **0.5 s**) to seed
 the session block queue, then set the session active so the capture thread begins
 teeing subsequent blocks. Holding the lock across both steps makes the seam clean
 — every block already in the ring is in the snapshot, every block appended after
@@ -139,7 +139,7 @@ paused comes back paused (does not silently re-acquire the mic).
 | Var | Default | Meaning |
 |---|---|---|
 | `RING_SECONDS` | `10` | Ring-buffer span (lookback + slack) |
-| `LOOKBACK_SEC` | `2.0` | Audio retained from before the keypress |
+| `LOOKBACK_SEC` | `0.5` | Audio retained from before the keypress (was 2.0; trimmed — continuous capture means no startup gap to cover, so a short cushion avoids grabbing unwanted prior words) |
 | `HOTMIC_SOURCE` | `` (sox `-d`) | Optional explicit capture device |
 | `RESTART_IDLE_SEC` | `2700` | Idle re-exec (raised 20→45 min) |
 | `MAX_CHUNK_SEC`, `SILENCE_DUR`, `SILENCE_THRESH` | as today | Chunker splitting |
