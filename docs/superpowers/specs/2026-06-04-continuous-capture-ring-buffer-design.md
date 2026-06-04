@@ -113,11 +113,12 @@ paused comes back paused (does not silently re-acquire the mic).
 
 - **Model pre-warm** (eager load at daemon startup): kept. First transcription is
   still fast.
-- **20-min idle re-exec** (`RESTART_IDLE_SEC`): kept for RAM hygiene. "Idle" still
-  means *no active session*. The re-exec path must **kill the persistent `sox`
-  child before `os.execv`** (otherwise it is orphaned writing to a dead pipe); the
-  new `main()` respawns capture. The brief capture gap happens only while idle, so
-  no words are lost. Never fires mid-session (existing `dictation_active()` guard).
+- **45-min idle re-exec** (`RESTART_IDLE_SEC`, default `2700`): kept for RAM
+  hygiene. "Idle" still means *no active session*. The re-exec path must **kill the
+  persistent `sox` child before `os.execv`** (otherwise it is orphaned writing to a
+  dead pipe); the new `main()` respawns capture. The brief capture gap happens only
+  while idle, so no words are lost. Never fires mid-session (existing
+  `dictation_active()` guard).
 - **`window_id`, indicator, xdotool typing, non-speech skipping**: unchanged.
 - **`STATE_FILE` (`$DIR/active`)**: kept as the watchdog "session active/starting"
   guard and as `start.sh`'s authoritative signal.
@@ -140,7 +141,7 @@ paused comes back paused (does not silently re-acquire the mic).
 | `RING_SECONDS` | `10` | Ring-buffer span (lookback + slack) |
 | `LOOKBACK_SEC` | `2.0` | Audio retained from before the keypress |
 | `HOTMIC_SOURCE` | `` (sox `-d`) | Optional explicit capture device |
-| `RESTART_IDLE_SEC` | `1200` | Idle re-exec (unchanged) |
+| `RESTART_IDLE_SEC` | `2700` | Idle re-exec (raised 20→45 min) |
 | `MAX_CHUNK_SEC`, `SILENCE_DUR`, `SILENCE_THRESH` | as today | Chunker splitting |
 
 ## Resource cost (measured 2026-06-04)
