@@ -128,14 +128,14 @@ if [ "$HOTMIC_BACKEND" = "whisper" ]; then
         log "Whisper daemon already running"
     fi
 
-    # Start recording — sox writes raw PCM to the FIFO.
-    # The daemon blocks on FIFO open until this writer connects.
-    sox -q -d -c "$SOX_CHANNELS" -r "$SOX_RATE" -b "$SOX_BITS" -e signed-integer \
-        -t raw "$DIR/audio.fifo" 2>>"$LOG_FILE" &
-    SOX_PID=$!
-    echo "$SOX_PID" > "$DIR/rec.pid"
+    # The resident daemon owns continuous mic capture. Just tell it to start a
+    # dictation session — it includes ~2s of pre-keypress audio via lookback.
+    # The daemon holds control.fifo open O_RDWR, so this write does not block.
+    if ! timeout 2 sh -c "printf 'START\n' > '$DIR/control.fifo'" 2>>"$LOG_FILE"; then
+        log "WARN: control FIFO write (START) timed out"
+    fi
 
-    log "Dictation started (sox PID $SOX_PID)"
+    log "Dictation started (START -> daemon)"
     log "Ready"
     exit 0
 fi
