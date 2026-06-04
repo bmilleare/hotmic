@@ -146,6 +146,34 @@ def test_capture_loop_fills_ring_and_stops_on_eof():
     assert len(ring.snapshot()) == n     # stopped at EOF
 
 
+class _ChunkedSource:
+    """Simulates a pipe: read(n) returns at most `cap` bytes per call, b'' at EOF."""
+
+    def __init__(self, data, cap):
+        self.buf = data
+        self.pos = 0
+        self.cap = cap
+
+    def read(self, n):
+        n = min(n, self.cap)
+        chunk = self.buf[self.pos:self.pos + n]
+        self.pos += len(chunk)
+        return chunk
+
+
+def test_capture_loop_handles_short_reads():
+    from threading import Event
+    ring = w.RingBuffer(maxlen=200)
+    n = 4
+    src = _ChunkedSource(b"".join(_speech_blk() for _ in range(n)), cap=500)  # < 1600
+    stop = Event()
+    ticks = iter([float(i) for i in range(100)])
+    w.capture_loop(src, ring, stop, clock=lambda: next(ticks))
+    snap = ring.snapshot()
+    assert len(snap) == n
+    assert all(len(b) == w.BLOCK_BYTES for _, b in snap)
+
+
 def test_capture_loop_tees_into_active_session():
     from threading import Event
     ring = w.RingBuffer(maxlen=200)

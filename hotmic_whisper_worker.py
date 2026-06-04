@@ -250,13 +250,26 @@ class SessionManager:
                 self.log(f"type error: {e}")
 
 
+def _read_exact(source, n):
+    """Read exactly n bytes from source, looping over short reads (a pipe's
+    .read(n) may return fewer bytes than asked). Returns None at true EOF."""
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = source.read(n - len(buf))
+        if not chunk:          # b'' == EOF (e.g. capture sox died/was killed)
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+
 def capture_loop(source, ring, stop_event, clock=time.monotonic):
-    """Read BLOCK_BYTES at a time from `source` (a file-like with .read) into the
-    ring buffer until stop_event is set or the source hits EOF. The ring tees into
-    the active session queue, if any. Partial trailing reads are dropped."""
+    """Read fixed BLOCK_BYTES frames from `source` (a file-like with .read) into
+    the ring buffer until stop_event is set or the source hits EOF. The ring tees
+    into the active session queue, if any. Short reads are coalesced into full
+    blocks; a partial block at EOF is dropped."""
     while not stop_event.is_set():
-        raw = source.read(BLOCK_BYTES)
-        if not raw or len(raw) < BLOCK_BYTES:
+        raw = _read_exact(source, BLOCK_BYTES)
+        if raw is None:        # true EOF
             break
         ring.append(clock(), raw)
 
@@ -437,14 +450,16 @@ def main():
         log("capture started (mic armed)")
 
     def _capture_supervisor(proc):
-        capture_loop(proc.stdout, sm.ring, capture_stop)
+        try:
+            capture_loop(proc.stdout, sm.ring, capture_stop)
+        finally:
+            try:
+                proc.wait(timeout=2)   # reap so we don't leave a <defunct> child
+            except Exception:
+                pass
         # Returned: either we asked it to stop, or sox died on its own.
         if not capture_stop.is_set() and not daemon_stop.is_set():
             log("capture sox ended unexpectedly; respawning")
-            try:
-                proc.kill()
-            except Exception:
-                pass
             capture_proc[0] = None
             time.sleep(0.5)
             start_capture()
