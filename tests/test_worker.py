@@ -200,3 +200,30 @@ def test_session_manager_includes_lookback_and_types(tmp_path):
     assert typed, "expected at least one typed chunk"
     first_n = int(typed[0].split("=")[1])
     assert first_n >= 40 * w.BLOCK_SAMPLES    # first chunk contains the lookback
+
+
+# ------------------------------------------------------------------ control_loop
+
+def test_control_thread_dispatches_commands(tmp_path):
+    import time
+    from threading import Event, Thread
+    fifo = str(tmp_path / "control.fifo")
+    os.mkfifo(fifo)
+    seen = []
+    stop = Event()
+    handlers = {
+        "START": lambda: seen.append("START"),
+        "STOP": lambda: seen.append("STOP"),
+        "PAUSE": lambda: seen.append("PAUSE"),
+        "RESUME": lambda: seen.append("RESUME"),
+    }
+    t = Thread(target=w.control_loop, args=(fifo, handlers, stop), daemon=True)
+    t.start()
+    with open(fifo, "w") as f:
+        f.write("START\nSTOP\nPAUSE\nRESUME\n")
+        f.flush()
+    deadline = time.time() + 3
+    while len(seen) < 4 and time.time() < deadline:
+        time.sleep(0.02)
+    stop.set()
+    assert seen == ["START", "STOP", "PAUSE", "RESUME"]

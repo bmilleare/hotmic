@@ -73,11 +73,11 @@ CAPTURE_CMD_DEFAULT = ["sox", "-q", "-d", "-t", "raw",
 # CTranslate2/CUDA pool up over transcriptions (~150 MB each) — model unload and
 # malloc_trim do NOT return it. It also frees the GPU and clears accumulated
 # X/xdotool state, and re-runs main() fresh while keeping the daemon resident +
-# ready. main() now pre-warms the model in the background immediately after the
-# re-exec, so the next dictation hits the warm path with no reload latency — the
-# 20 min window is just the RAM-reset cadence, no longer a warm-vs-cold gate.
-# Steady-state RSS with the model resident is ~1.4 GB, which is acceptable.
-RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "1200"))  # default 20 min
+# ready. main() pre-warms the model AND re-arms continuous capture immediately
+# after the re-exec (killing the old capture sox first), so the next dictation
+# still hits the warm path — the window is just the RAM-reset cadence, no longer a
+# warm-vs-cold gate. Steady-state RSS with the model resident is ~1.4 GB.
+RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "2700"))  # default 45 min
 # How often the watchdog re-checks idle time (lower only for tests).
 WATCHDOG_INTERVAL_SEC = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "30"))
 
@@ -261,6 +261,27 @@ def capture_loop(source, ring, stop_event, clock=time.monotonic):
         ring.append(clock(), raw)
 
 
+def control_loop(fifo_path, handlers, stop_event):
+    """Read newline-delimited commands from the control FIFO and dispatch.
+    Opened O_RDWR so the daemon always has a writer of its own -> reads block for
+    data instead of hitting EOF, and external writers never block."""
+    fd = os.open(fifo_path, os.O_RDWR)
+    with os.fdopen(fd, "r", buffering=1) as f:
+        while not stop_event.is_set():
+            line = f.readline()
+            if not line:
+                continue
+            cmd = line.strip().upper()
+            handler = handlers.get(cmd)
+            if handler:
+                try:
+                    handler()
+                except Exception as e:
+                    log(f"control handler error for {cmd}: {e}")
+            elif cmd:
+                log(f"unknown control command: {cmd!r}")
+
+
 def make_transcribe_fn(model_holder):
     """Adapt the resident whisper model to SessionManager's transcribe_fn(path)."""
     def transcribe(path):
@@ -319,138 +340,6 @@ def split_blocks_to_chunks(blocks, *, silence_blocks, silence_thresh,
         yield audio_buf
 
 
-def reader_loop(audio_input, chunk_queue, session_stop):
-    """Read continuous PCM from audio_input and split into chunks."""
-    chunk_num = 0
-    audio_buf = []
-    silent_blocks = 0
-    has_speech = False
-    max_samples = MAX_CHUNK_SEC * RATE
-
-    try:
-        while not session_stop.is_set():
-            raw = audio_input.read(BLOCK_BYTES)
-            if not raw:
-                break  # EOF — sox closed the FIFO
-
-            # Decode PCM samples
-            n_samples = len(raw) // SAMPWIDTH
-            samples = struct.unpack(f"<{n_samples}h", raw[:n_samples * SAMPWIDTH])
-            audio_buf.extend(samples)
-
-            # Analyse block
-            block_rms = rms(samples)
-            is_silent = block_rms < SILENCE_THRESH
-
-            if not is_silent:
-                has_speech = True
-                silent_blocks = 0
-            else:
-                silent_blocks += 1
-
-            # Split conditions
-            should_split = False
-            if has_speech and silent_blocks >= SILENCE_BLOCKS and len(audio_buf) >= MIN_CHUNK_SAMPLES:
-                should_split = True  # natural pause
-            elif len(audio_buf) >= max_samples:
-                should_split = True  # hard cap
-
-            if should_split:
-                chunk_path = os.path.join(CHUNK_DIR, f"chunk_{chunk_num}.wav")
-                samples_to_wav(audio_buf, chunk_path)
-                log(f"chunk {chunk_num}: {len(audio_buf)} samples ({len(audio_buf)/RATE:.1f}s) → queue")
-                chunk_queue.append((chunk_path, chunk_num))
-                chunk_num += 1
-                audio_buf = []
-                silent_blocks = 0
-                has_speech = False
-
-    except Exception as e:
-        log(f"reader error: {e}")
-
-    # Flush remaining audio — always flush at session end if we have enough
-    # samples. The user explicitly stopped, so transcribe whatever's left.
-    # (Whisper returns empty text for silence, which we skip anyway.)
-    if audio_buf and len(audio_buf) >= MIN_CHUNK_SAMPLES:
-        chunk_path = os.path.join(CHUNK_DIR, f"chunk_{chunk_num}.wav")
-        samples_to_wav(audio_buf, chunk_path)
-        log(f"final chunk {chunk_num}: {len(audio_buf)} samples ({len(audio_buf)/RATE:.1f}s) → queue")
-        chunk_queue.append((chunk_path, chunk_num))
-
-    log("reader finished")
-
-
-def transcriber_loop(model_holder, chunk_queue, session_stop, window_id):
-    """Transcribe chunks and type results into the target window."""
-    # Wait for model if still loading (first session may start before model is ready)
-    deadline = time.monotonic() + 120
-    while not model_holder:
-        if session_stop.is_set() and not chunk_queue:
-            return  # stopped with nothing to transcribe
-        if time.monotonic() > deadline:
-            log("model load timeout, giving up on session")
-            return
-        time.sleep(0.1)
-
-    model = model_holder[0]
-
-    while not session_stop.is_set() or chunk_queue:
-        if not chunk_queue:
-            session_stop.wait(0.05)
-            continue
-
-        chunk_path, chunk_num = chunk_queue.popleft()
-
-        if not os.path.isfile(chunk_path):
-            continue
-
-        size = os.path.getsize(chunk_path)
-        log(f"transcribing chunk {chunk_num} ({size} bytes)")
-
-        try:
-            segments, _ = model.transcribe(
-                chunk_path,
-                language="en",
-                beam_size=1,
-                temperature=0,
-            )
-            text = " ".join(s.text for s in segments).strip()
-        except Exception as e:
-            log(f"transcribe error: {e}")
-            text = ""
-        finally:
-            try:
-                os.remove(chunk_path)
-            except OSError:
-                pass
-
-        # Skip empty or non-speech transcriptions. Whisper emits punctuation-only
-        # noise ("." / ".." / "..." / ". .") for silence and breaths; typing that
-        # is worse than nothing. Requiring at least one alphanumeric character
-        # drops the noise without risking real short words ("you", "ok", "no").
-        if not any(c.isalnum() for c in text):
-            log(f"skipping non-speech transcription: {text!r}")
-            continue
-
-        log(f"transcribed: {text}")
-        try:
-            if window_id:
-                # Briefly focus the target window, type, then let the user's
-                # current window naturally retain focus. windowactivate is more
-                # reliable than --window (which sends synthetic events many
-                # apps ignore).
-                subprocess.run(
-                    ["xdotool", "windowactivate", "--sync", window_id],
-                    timeout=2,
-                )
-            subprocess.run(
-                ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text + " "],
-                timeout=5,
-            )
-        except Exception as e:
-            log(f"xdotool error: {e}")
-
-
 def main():
     model_name = os.environ.get("WHISPER_MODEL", "medium.en")
     device = os.environ.get("WHISPER_DEVICE", "cuda")
@@ -458,11 +347,11 @@ def main():
 
     os.makedirs(CHUNK_DIR, exist_ok=True)
 
-    # Create FIFO
-    if os.path.exists(FIFO_PATH) and not stat_is_fifo(FIFO_PATH):
-        os.remove(FIFO_PATH)
-    if not os.path.exists(FIFO_PATH):
-        os.mkfifo(FIFO_PATH)
+    # Create the control FIFO (start/stop/pause/resume commands from the scripts).
+    if os.path.exists(CONTROL_FIFO) and not stat_is_fifo(CONTROL_FIFO):
+        os.remove(CONTROL_FIFO)
+    if not os.path.exists(CONTROL_FIFO):
+        os.mkfifo(CONTROL_FIFO)
 
     # Graceful shutdown
     daemon_stop = Event()
@@ -517,6 +406,59 @@ def main():
     def dictation_active():
         return in_session.is_set() or os.path.exists(STATE_FILE)
 
+    # --- Continuous capture: the daemon owns the mic and fills sm.ring 24/7. ---
+    # Defined before the watchdog because the watchdog's pre-execv path calls
+    # stop_capture() (the capture sox must be killed before execv, else it is
+    # orphaned writing to a dead pipe).
+    capture_stop = Event()
+    capture_proc = [None]   # persistent sox subprocess (list so closures can swap it)
+
+    sm = SessionManager(
+        ring=RingBuffer(RING_BLOCKS),
+        chunk_dir=CHUNK_DIR,
+        transcribe_fn=make_transcribe_fn(model_holder),
+        type_fn=type_into_window,
+        get_window_fn=get_target_window,
+        log_fn=log,
+        lookback_sec=LOOKBACK_SEC,
+    )
+
+    def start_capture():
+        """Spawn the persistent sox + a supervisor thread reading it into sm.ring."""
+        if capture_proc[0] is not None:
+            return
+        src = os.environ.get("HOTMIC_SOURCE")
+        argv = (["sox", "-q", "-t", "alsa", src] + CAPTURE_CMD_DEFAULT[3:]) if src else CAPTURE_CMD_DEFAULT
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=open(LOG_FILE, "a"), bufsize=0)
+        capture_proc[0] = proc
+        capture_stop.clear()
+        Thread(target=_capture_supervisor, args=(proc,), daemon=True).start()
+        log("capture started (mic armed)")
+
+    def _capture_supervisor(proc):
+        capture_loop(proc.stdout, sm.ring, capture_stop)
+        # Returned: either we asked it to stop, or sox died on its own.
+        if not capture_stop.is_set() and not daemon_stop.is_set():
+            log("capture sox ended unexpectedly; respawning")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            capture_proc[0] = None
+            time.sleep(0.5)
+            start_capture()
+
+    def stop_capture():
+        capture_stop.set()
+        proc = capture_proc[0]
+        capture_proc[0] = None
+        if proc is not None:
+            try:
+                proc.kill()   # EOF on proc.stdout unblocks capture_loop's read()
+            except Exception:
+                pass
+
     # Watchdog thread: re-execs the whole process after RESTART_IDLE_SEC of
     # inactivity. A full restart is the ONLY way to reclaim the multi-GB host RAM
     # CTranslate2/CUDA pool up over transcriptions (model unload / malloc_trim
@@ -545,11 +487,12 @@ def main():
                     continue
                 log(f"idle for {int(idle)}s, re-exec for fresh process "
                     f"(frees GPU + reclaims host RAM; daemon stays resident + ready)")
-                # Keep whisper.ready and the FIFO in place so start.sh keeps seeing
-                # a ready resident daemon (warm path). execv replaces this entire
-                # process image — including the main thread blocked in open(FIFO) —
-                # and re-runs main() fresh, inheriting the current environment
-                # (LD_LIBRARY_PATH, WHISPER_*, MAX_CHUNK_SEC, ...).
+                # Kill the persistent capture sox first — execv would otherwise
+                # orphan it writing to a dead pipe. Keep whisper.ready + control
+                # FIFO in place so the scripts keep seeing a ready daemon. execv
+                # replaces this whole process image and re-runs main() fresh,
+                # inheriting the environment (LD_LIBRARY_PATH, WHISPER_*, ...).
+                stop_capture()
                 os.execv(sys.executable, [sys.executable, os.path.abspath(__file__)])
                 return  # unreachable if execv succeeds
 
@@ -558,85 +501,61 @@ def main():
 
     # Pre-warm the model eagerly in the background so the daemon is ready to
     # transcribe the instant the next dictation lands — no first-session reload
-    # delay. This runs on every fresh start AND after every idle re-exec (execv
-    # re-runs main()), so a recording after the idle restart hits the warm path
-    # too. Loading in a background thread keeps readiness immediate; the reader
-    # buffers audio and the transcriber waits if a session starts mid-load. The
-    # lazy load path in the session loop below remains a fallback (e.g. if this
-    # pre-warm failed). Holding the model resident is ~1.4 GB RSS — acceptable now
-    # that runaway growth is bounded.
+    # delay. Runs on every fresh start AND after every idle re-exec (execv re-runs
+    # main()). Background load keeps readiness immediate. Holding the model
+    # resident is ~1.4 GB RSS — acceptable now that runaway growth is bounded.
     Thread(target=load_model, daemon=True).start()
 
-    # Signal readiness — FIFO exists, daemon is accepting sessions.
-    open(READY_FILE, "w").close()
-    log(f"daemon ready, pre-warming model (idle restart: {RESTART_IDLE_SEC}s)")
-
-    # === Main session loop ===
-    while not daemon_stop.is_set():
-        # Open FIFO for reading — blocks until sox opens it for writing. While
-        # blocked here the daemon is idle, so the watchdog may re-exec the process.
-        try:
-            fifo = open(FIFO_PATH, "rb")
-        except OSError as e:
-            if daemon_stop.is_set():
-                break
-            log(f"FIFO open error: {e}")
-            time.sleep(0.5)
-            continue
-
-        # A writer (sox) connected — mark the session active so the watchdog won't
-        # unload the model under us. The window between this open() returning and
-        # here was already guarded by start.sh's STATE_FILE.
+    # --- Session + pause control handlers (operate on the continuous capture) ---
+    def do_start():
         in_session.set()
-        try:
-            # Load the model if it isn't resident — the lazy first-load path and
-            # the reload-after-idle-unload path. The reader buffers audio while
-            # this runs in the background; the transcriber waits for it.
-            if not model_holder and not model_loading.is_set():
-                log("model not loaded, loading for new session...")
-                loader = Thread(target=load_model, daemon=True)
-                loader.start()
+        if capture_proc[0] is None:    # armed from paused -> cold path, no lookback
+            if os.path.exists(PAUSED_FLAG):
+                os.remove(PAUSED_FLAG)
+            start_capture()
+        sm.start()
 
-            window_id = get_target_window()
-            log(f"session started (target window: {window_id or 'active'})")
+    def do_stop():
+        sm.stop()
+        last_session_end[0] = sm.last_end[0]
+        in_session.clear()
 
-            chunk_queue = deque()
-            session_stop = Event()
-
-            reader = Thread(target=reader_loop, args=(fifo, chunk_queue, session_stop))
-            reader.start()
-
-            transcriber = Thread(target=transcriber_loop, args=(model_holder, chunk_queue, session_stop, window_id))
-            transcriber.start()
-
-            # Wait for reader to finish (EOF = sox died / was killed)
-            reader.join()
-
-            # Wait for transcriber to drain remaining chunks
-            drain_deadline = time.monotonic() + 30
-            while chunk_queue and time.monotonic() < drain_deadline:
-                time.sleep(0.1)
-
-            session_stop.set()
-            transcriber.join(timeout=15)
-
-            try:
-                fifo.close()
-            except OSError:
-                pass
-
-            last_session_end[0] = time.monotonic()
-            log("session complete")
-        finally:
+    def do_pause():
+        if sm.active.is_set():
+            sm.stop()
             in_session.clear()
+        stop_capture()
+        open(PAUSED_FLAG, "w").close()
+        log("paused (mic released)")
 
-    # Cleanup
+    def do_resume():
+        if os.path.exists(PAUSED_FLAG):
+            os.remove(PAUSED_FLAG)
+        start_capture()
+        log("resumed (mic armed)")
+
+    handlers = {"START": do_start, "STOP": do_stop, "PAUSE": do_pause, "RESUME": do_resume}
+
+    # Arm capture now unless we were paused before a re-exec.
+    if not os.path.exists(PAUSED_FLAG):
+        start_capture()
+
+    control = Thread(target=control_loop, args=(CONTROL_FIFO, handlers, daemon_stop), daemon=True)
+    control.start()
+
+    # Signal readiness — control FIFO exists, capture armed, daemon accepting.
+    open(READY_FILE, "w").close()
+    log(f"daemon ready, pre-warming model + continuous capture "
+        f"(idle restart: {RESTART_IDLE_SEC}s)")
+
+    # The watchdog, control, capture and session threads do the work; the main
+    # thread just idles until shutdown.
+    while not daemon_stop.is_set():
+        daemon_stop.wait(1.0)
+
+    stop_capture()
     try:
         os.remove(READY_FILE)
-    except OSError:
-        pass
-    try:
-        os.remove(FIFO_PATH)
     except OSError:
         pass
     log("daemon exiting")
