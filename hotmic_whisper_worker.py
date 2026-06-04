@@ -57,11 +57,10 @@ MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 # CTranslate2/CUDA pool up over transcriptions (~150 MB each) — model unload and
 # malloc_trim do NOT return it. It also frees the GPU and clears accumulated
 # X/xdotool state, and re-runs main() fresh while keeping the daemon resident +
-# ready so the next session still hits the warm path. Set to 20 min: re-exec drops
-# the resident model, so a recording inside this window hits the warm (model-loaded)
-# path with no reload latency. 5 min was too short — normal gaps between dictations
-# regularly exceeded it, so the next recording paid a cold model reload. Longer
-# window trades held host RAM for fewer reloads.
+# ready. main() now pre-warms the model in the background immediately after the
+# re-exec, so the next dictation hits the warm path with no reload latency — the
+# 20 min window is just the RAM-reset cadence, no longer a warm-vs-cold gate.
+# Steady-state RSS with the model resident is ~1.4 GB, which is acceptable.
 RESTART_IDLE_SEC = int(os.environ.get("RESTART_IDLE_SEC", "1200"))  # default 20 min
 # How often the watchdog re-checks idle time (lower only for tests).
 WATCHDOG_INTERVAL_SEC = int(os.environ.get("WATCHDOG_INTERVAL_SEC", "30"))
@@ -306,9 +305,10 @@ def main():
     # state. It replaces the old SIGTERM (which the main thread — blocked in
     # open(FIFO) — never observed, so the process just lingered and the NEXT
     # keypress paid a cold-spawn gap that ate the start of dictation) and re-runs
-    # main() fresh while keeping the daemon resident + ready. A recording inside the
-    # RESTART_IDLE_SEC window still hits the warm path; only one landing after the
-    # re-exec pays a lazy model reload. It never fires while a
+    # main() fresh while keeping the daemon resident + ready. main() pre-warms the
+    # model in the background right after re-exec, so a recording after the idle
+    # restart still hits the warm path (no reload delay) unless it lands in the
+    # few seconds before the reload finishes. It never fires while a
     # dictation is active or starting (dictation_active guard, re-checked just
     # before execv).
     def idle_watchdog():
@@ -337,16 +337,20 @@ def main():
     watchdog = Thread(target=idle_watchdog, daemon=True)
     watchdog.start()
 
-    # Model is loaded LAZILY on the first session (see the load path in the
-    # session loop below), not eagerly here. This keeps an idle or just-re-exec'd
-    # daemon at ~150 MB RSS instead of holding the model's multi-GB host
-    # allocation while nobody is dictating; the reader buffers audio while the
-    # model loads on demand, so the start of speech is still captured.
+    # Pre-warm the model eagerly in the background so the daemon is ready to
+    # transcribe the instant the next dictation lands — no first-session reload
+    # delay. This runs on every fresh start AND after every idle re-exec (execv
+    # re-runs main()), so a recording after the idle restart hits the warm path
+    # too. Loading in a background thread keeps readiness immediate; the reader
+    # buffers audio and the transcriber waits if a session starts mid-load. The
+    # lazy load path in the session loop below remains a fallback (e.g. if this
+    # pre-warm failed). Holding the model resident is ~1.4 GB RSS — acceptable now
+    # that runaway growth is bounded.
+    Thread(target=load_model, daemon=True).start()
 
     # Signal readiness — FIFO exists, daemon is accepting sessions.
-    # The model loads on the first session; the transcriber waits for it.
     open(READY_FILE, "w").close()
-    log(f"daemon ready, accepting audio (idle restart: {RESTART_IDLE_SEC}s)")
+    log(f"daemon ready, pre-warming model (idle restart: {RESTART_IDLE_SEC}s)")
 
     # === Main session loop ===
     while not daemon_stop.is_set():
