@@ -157,3 +157,46 @@ def test_capture_loop_tees_into_active_session():
     w.capture_loop(src, ring, stop, clock=lambda: next(ticks))
     drained = _drain(q)
     assert len(drained) == 1 + 3         # seeded silence + 3 teed speech
+
+
+# --------------------------------------------------------------- SessionManager
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_session_manager_includes_lookback_and_types(tmp_path):
+    typed = []
+
+    def fake_transcribe(path):
+        import wave
+        with wave.open(path, "rb") as wf:
+            return f"n={wf.getnframes()}"
+
+    sm = w.SessionManager(
+        ring=w.RingBuffer(maxlen=200),
+        chunk_dir=str(tmp_path),
+        transcribe_fn=fake_transcribe,
+        type_fn=lambda text, wid: typed.append(text),
+        get_window_fn=lambda: "win",
+        clock=_FakeClock(),
+        lookback_sec=2.0,
+    )
+    sb = int(w.SILENCE_DUR / 0.05)
+    # 2.0s of lookback already in the ring before start (ts 8.0..9.95)
+    for i in range(40):
+        sm.ring.append(8.0 + i * 0.05, _speech_blk())
+    sm.clock.now = 10.0
+    sm.start()                                # t_start=10.0 -> grabs the 40 blocks
+    for i in range(20):                       # a bit more speech
+        sm.ring.append(10.0 + i * 0.05, _speech_blk())
+    for i in range(sb):                       # silence -> force a chunk
+        sm.ring.append(11.0 + i * 0.05, _silence_blk())
+    sm.stop()                                 # drains + joins
+    assert typed, "expected at least one typed chunk"
+    first_n = int(typed[0].split("=")[1])
+    assert first_n >= 40 * w.BLOCK_SAMPLES    # first chunk contains the lookback

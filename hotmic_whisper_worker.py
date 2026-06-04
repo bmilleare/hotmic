@@ -157,6 +157,99 @@ class RingBuffer:
         return q
 
 
+class SessionManager:
+    """Owns the lifecycle of one dictation at a time over the live ring buffer."""
+
+    def __init__(self, ring, chunk_dir, transcribe_fn, type_fn, get_window_fn,
+                 log_fn=lambda m: None, clock=time.monotonic, lookback_sec=LOOKBACK_SEC):
+        self.ring = ring
+        self.chunk_dir = chunk_dir
+        self.transcribe_fn = transcribe_fn
+        self.type_fn = type_fn
+        self.get_window_fn = get_window_fn
+        self.log = log_fn
+        self.clock = clock
+        self.lookback_sec = lookback_sec
+        self.active = Event()
+        self._threads = []
+        self.last_end = [clock()]
+
+    def start(self):
+        if self.active.is_set():
+            return  # duplicate START ignored
+        t_start = self.clock()
+        session_q = self.ring.start_session(t_start, self.lookback_sec)
+        window_id = self.get_window_fn()
+        self.active.set()
+        chunk_q = queue.Queue()
+        chunker = Thread(target=self._chunker, args=(session_q, chunk_q), daemon=True)
+        transcriber = Thread(target=self._transcriber, args=(chunk_q, window_id), daemon=True)
+        chunker.start()
+        transcriber.start()
+        self._threads = [chunker, transcriber]
+        self.log(f"session started (window {window_id})")
+
+    def stop(self):
+        if not self.active.is_set():
+            return
+        self.ring.stop_session()          # disarms tee + pushes sentinel to session_q
+        for t in self._threads:
+            t.join(timeout=30)
+        self._threads = []
+        self.active.clear()
+        self.last_end[0] = self.clock()
+        self.log("session complete")
+
+    def _chunker(self, session_q, chunk_q):
+        def block_iter():
+            while True:
+                block = session_q.get()
+                if block is None:         # sentinel from stop_session
+                    return
+                yield block
+        num = 0
+        for samples in split_blocks_to_chunks(
+            block_iter(),
+            silence_blocks=int(SILENCE_DUR / 0.05),
+            silence_thresh=SILENCE_THRESH,
+            min_chunk_samples=int(RATE * 0.3),
+            max_samples=MAX_CHUNK_SEC * RATE,
+        ):
+            path = os.path.join(self.chunk_dir, f"chunk_{num}.wav")
+            samples_to_wav(samples, path)
+            chunk_q.put((path, num))
+            num += 1
+        chunk_q.put(None)                 # sentinel to transcriber
+
+    def _transcriber(self, chunk_q, window_id):
+        while True:
+            item = chunk_q.get()
+            if item is None:
+                return
+            path, num = item
+            if not os.path.isfile(path):
+                continue
+            try:
+                text = self.transcribe_fn(path)
+            except Exception as e:
+                self.log(f"transcribe error: {e}")
+                text = ""
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            # Skip empty / punctuation-only noise (whisper emits "." for silence).
+            if not any(c.isalnum() for c in text):
+                self.log(f"skipping non-speech: {text!r}")
+                continue
+            self.log(f"transcribed: {text}")
+            try:
+                self.type_fn(text, window_id)
+            except Exception as e:
+                self.log(f"type error: {e}")
+
+
 def capture_loop(source, ring, stop_event, clock=time.monotonic):
     """Read BLOCK_BYTES at a time from `source` (a file-like with .read) into the
     ring buffer until stop_event is set or the source hits EOF. The ring tees into
