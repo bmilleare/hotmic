@@ -157,6 +157,17 @@ class RingBuffer:
         return q
 
 
+def capture_loop(source, ring, stop_event, clock=time.monotonic):
+    """Read BLOCK_BYTES at a time from `source` (a file-like with .read) into the
+    ring buffer until stop_event is set or the source hits EOF. The ring tees into
+    the active session queue, if any. Partial trailing reads are dropped."""
+    while not stop_event.is_set():
+        raw = source.read(BLOCK_BYTES)
+        if not raw or len(raw) < BLOCK_BYTES:
+            break
+        ring.append(clock(), raw)
+
+
 def split_blocks_to_chunks(blocks, *, silence_blocks, silence_thresh,
                            min_chunk_samples, max_samples):
     """Consume raw byte blocks; yield chunks as sample lists, splitting on a

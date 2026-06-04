@@ -131,3 +131,29 @@ def test_chunker_drops_subminimum_remainder():
         max_samples=w.MAX_CHUNK_SEC * w.RATE,
     ))
     assert chunks == []
+
+
+# ----------------------------------------------------------------- capture_loop
+
+def test_capture_loop_fills_ring_and_stops_on_eof():
+    from threading import Event
+    ring = w.RingBuffer(maxlen=200)
+    n = 5
+    src = io.BytesIO(b"".join(_silence_blk() for _ in range(n)))
+    stop = Event()
+    ticks = iter([float(i) for i in range(100)])
+    w.capture_loop(src, ring, stop, clock=lambda: next(ticks))
+    assert len(ring.snapshot()) == n     # stopped at EOF
+
+
+def test_capture_loop_tees_into_active_session():
+    from threading import Event
+    ring = w.RingBuffer(maxlen=200)
+    ring.append(0.0, _silence_blk())
+    q = ring.start_session(t_start=0.0, lookback_sec=2.0)
+    src = io.BytesIO(b"".join(_speech_blk() for _ in range(3)))
+    stop = Event()
+    ticks = iter([0.01, 0.02, 0.03])
+    w.capture_loop(src, ring, stop, clock=lambda: next(ticks))
+    drained = _drain(q)
+    assert len(drained) == 1 + 3         # seeded silence + 3 teed speech
