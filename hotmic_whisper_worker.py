@@ -261,6 +261,27 @@ def capture_loop(source, ring, stop_event, clock=time.monotonic):
         ring.append(clock(), raw)
 
 
+def make_transcribe_fn(model_holder):
+    """Adapt the resident whisper model to SessionManager's transcribe_fn(path)."""
+    def transcribe(path):
+        model = model_holder[0]
+        segments, _ = model.transcribe(path, language="en", beam_size=1, temperature=0)
+        return " ".join(s.text for s in segments).strip()
+    return transcribe
+
+
+def type_into_window(text, window_id):
+    """SessionManager's type_fn: focus the target window, then type the text.
+    windowactivate is more reliable than --window (synthetic events many apps
+    ignore)."""
+    if window_id:
+        subprocess.run(["xdotool", "windowactivate", "--sync", window_id], timeout=2)
+    subprocess.run(
+        ["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", text + " "],
+        timeout=5,
+    )
+
+
 def split_blocks_to_chunks(blocks, *, silence_blocks, silence_thresh,
                            min_chunk_samples, max_samples):
     """Consume raw byte blocks; yield chunks as sample lists, splitting on a
