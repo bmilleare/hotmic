@@ -157,6 +157,43 @@ class RingBuffer:
         return q
 
 
+def split_blocks_to_chunks(blocks, *, silence_blocks, silence_thresh,
+                           min_chunk_samples, max_samples):
+    """Consume raw byte blocks; yield chunks as sample lists, splitting on a
+    natural silence pause or the MAX hard cap. Mirrors the original reader_loop
+    splitting. Flushes the remainder at end-of-stream if >= min_chunk_samples."""
+    audio_buf = []
+    silent_blocks = 0
+    has_speech = False
+    for raw in blocks:
+        if not raw:
+            break
+        n = len(raw) // SAMPWIDTH
+        samples = struct.unpack(f"<{n}h", raw[:n * SAMPWIDTH])
+        audio_buf.extend(samples)
+
+        if rms(samples) < silence_thresh:
+            silent_blocks += 1
+        else:
+            has_speech = True
+            silent_blocks = 0
+
+        should_split = False
+        if has_speech and silent_blocks >= silence_blocks and len(audio_buf) >= min_chunk_samples:
+            should_split = True
+        elif len(audio_buf) >= max_samples:
+            should_split = True
+
+        if should_split:
+            yield audio_buf
+            audio_buf = []
+            silent_blocks = 0
+            has_speech = False
+
+    if audio_buf and len(audio_buf) >= min_chunk_samples:
+        yield audio_buf
+
+
 def reader_loop(audio_input, chunk_queue, session_stop):
     """Read continuous PCM from audio_input and split into chunks."""
     chunk_num = 0

@@ -76,3 +76,58 @@ def test_stop_session_pushes_sentinel_and_disarms():
             break
         got.append(item)
     assert got == [_blk(1)]
+
+
+# ----------------------------------------------------- split_blocks_to_chunks
+
+def test_chunker_splits_on_silence():
+    sb = int(w.SILENCE_DUR / 0.05)     # SILENCE_BLOCKS (16 by default)
+    blocks = [_speech_blk()] * 20 + [_silence_blk()] * sb
+    chunks = list(w.split_blocks_to_chunks(
+        iter(blocks),
+        silence_blocks=sb,
+        silence_thresh=w.SILENCE_THRESH,
+        min_chunk_samples=int(w.RATE * 0.3),
+        max_samples=w.MAX_CHUNK_SEC * w.RATE,
+    ))
+    assert len(chunks) == 1
+    assert len(chunks[0]) == (20 + sb) * w.BLOCK_SAMPLES
+
+
+def test_chunker_hard_caps_at_max_samples():
+    max_samples = 2 * w.RATE           # tiny cap for the test: 2s
+    nblocks = int(5 * w.RATE / w.BLOCK_SAMPLES)   # ~5s of speech
+    chunks = list(w.split_blocks_to_chunks(
+        iter([_speech_blk()] * nblocks),
+        silence_blocks=9999,           # never silence-split
+        silence_thresh=w.SILENCE_THRESH,
+        min_chunk_samples=int(w.RATE * 0.3),
+        max_samples=max_samples,
+    ))
+    assert len(chunks) >= 2
+    assert all(len(c) <= max_samples for c in chunks)
+
+
+def test_chunker_flushes_remainder():
+    blocks = [_speech_blk()] * 10      # 8000 samples > min 4800
+    chunks = list(w.split_blocks_to_chunks(
+        iter(blocks),
+        silence_blocks=16,
+        silence_thresh=w.SILENCE_THRESH,
+        min_chunk_samples=int(w.RATE * 0.3),
+        max_samples=w.MAX_CHUNK_SEC * w.RATE,
+    ))
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 10 * w.BLOCK_SAMPLES
+
+
+def test_chunker_drops_subminimum_remainder():
+    blocks = [_speech_blk()] * 2       # 1600 samples < min 4800
+    chunks = list(w.split_blocks_to_chunks(
+        iter(blocks),
+        silence_blocks=16,
+        silence_thresh=w.SILENCE_THRESH,
+        min_chunk_samples=int(w.RATE * 0.3),
+        max_samples=w.MAX_CHUNK_SEC * w.RATE,
+    ))
+    assert chunks == []
