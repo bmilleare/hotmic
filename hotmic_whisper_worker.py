@@ -19,10 +19,11 @@ import struct
 import signal
 import math
 import time
+import queue
 import subprocess
 import traceback
 from collections import deque
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 
 DIR = os.environ.get("HOTMIC_DIR", "/tmp/hotmic")  # overridable for isolated tests
 # Created by hotmic_start.sh before it launches sox, removed by hotmic_stop.sh —
@@ -51,6 +52,21 @@ BLOCK_SAMPLES = int(RATE * 0.05)  # 50ms blocks
 BLOCK_BYTES = BLOCK_SAMPLES * SAMPWIDTH
 SILENCE_BLOCKS = int(SILENCE_DUR / 0.05)  # blocks of silence needed to split
 MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
+
+# Continuous capture: the daemon holds the mic open and fills a rolling ring
+# buffer, so a dictation is a [t_start - LOOKBACK, t_stop] window over an
+# always-live stream — no startup gap, and we keep audio from just before the
+# keypress. See docs/superpowers/specs/2026-06-04-continuous-capture-ring-buffer.
+RING_SECONDS = float(os.environ.get("RING_SECONDS", "10"))
+LOOKBACK_SEC = float(os.environ.get("LOOKBACK_SEC", "2.0"))
+RING_BLOCKS = max(1, int(RING_SECONDS / 0.05))  # 50ms blocks -> 200 for 10s
+CONTROL_FIFO = f"{DIR}/control.fifo"
+PAUSED_FLAG = f"{DIR}/paused"
+# Persistent mic capture (raw 16k mono s16le to stdout). HOTMIC_SOURCE pins an
+# explicit ALSA device; default uses sox's default input (-d).
+CAPTURE_CMD_DEFAULT = ["sox", "-q", "-d", "-t", "raw",
+                       "-r", str(RATE), "-c", str(CHANNELS), "-b", "16",
+                       "-e", "signed-integer", "-"]
 
 # Idle restart: after this many seconds with no dictation, re-exec the daemon.
 # A full process restart is the ONLY thing that reclaims the multi-GB host RAM
@@ -98,6 +114,47 @@ def get_target_window():
             return wid if wid else None
     except OSError:
         return None
+
+
+class RingBuffer:
+    """Rolling buffer of (monotonic_ts, raw_bytes) blocks, plus an optional
+    session tee. The lock makes the lookback snapshot and the tee-arm atomic, so
+    there is no gap or duplicate block at the session-start seam."""
+
+    def __init__(self, maxlen):
+        self._dq = deque(maxlen=maxlen)
+        self._lock = Lock()
+        self._tee = None   # queue.Queue while a session is active
+
+    def append(self, ts, block):
+        with self._lock:
+            self._dq.append((ts, block))
+            if self._tee is not None:
+                self._tee.put(block)
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._dq)
+
+    def start_session(self, t_start, lookback_sec):
+        """Seed a fresh session queue with the lookback blocks and arm the tee,
+        atomically. Returns the queue."""
+        q = queue.Queue()
+        with self._lock:
+            for ts, block in self._dq:
+                if ts >= t_start - lookback_sec:
+                    q.put(block)
+            self._tee = q
+        return q
+
+    def stop_session(self):
+        """Disarm the tee and push the end sentinel (None) onto the queue."""
+        with self._lock:
+            q = self._tee
+            self._tee = None
+        if q is not None:
+            q.put(None)
+        return q
 
 
 def reader_loop(audio_input, chunk_queue, session_stop):
