@@ -140,6 +140,7 @@ paused comes back paused (does not silently re-acquire the mic).
 |---|---|---|
 | `RING_SECONDS` | `10` | Ring-buffer span (lookback + slack) |
 | `LOOKBACK_SEC` | `0.5` | Audio retained from before the keypress (was 2.0; trimmed — continuous capture means no startup gap to cover, so a short cushion avoids grabbing unwanted prior words) |
+| `TRAILING_SEC` | `0.5` | Audio captured AFTER the stop keypress (the tail of the final word, which the user often finishes saying as/just after hitting the hotkey). Symmetric with the lookback. Pause stops immediately (trailing=0). |
 | `HOTMIC_SOURCE` | `` (sox `-d`) | Optional explicit capture device |
 | `RESTART_IDLE_SEC` | `2700` | Idle re-exec (raised 20→45 min) |
 | `MAX_CHUNK_SEC`, `SILENCE_DUR`, `SILENCE_THRESH` | as today | Chunker splitting |

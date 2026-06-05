@@ -1,4 +1,4 @@
-import sys, os, struct, io
+import sys, os, struct, io, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import hotmic_whisper_worker as w
 
@@ -213,6 +213,7 @@ def test_session_manager_includes_lookback_and_types(tmp_path):
         get_window_fn=lambda: "win",
         clock=_FakeClock(),
         lookback_sec=2.0,
+        trailing_sec=0,
     )
     sb = int(w.SILENCE_DUR / 0.05)
     # 2.0s of lookback already in the ring before start (ts 8.0..9.95)
@@ -228,6 +229,42 @@ def test_session_manager_includes_lookback_and_types(tmp_path):
     assert typed, "expected at least one typed chunk"
     first_n = int(typed[0].split("=")[1])
     assert first_n >= 40 * w.BLOCK_SAMPLES    # first chunk contains the lookback
+
+
+def test_stop_includes_trailing_audio(tmp_path):
+    """Audio that arrives during the trailing window (after stop() is called) must
+    still be captured — the tail of the final word."""
+    import threading
+    typed = []
+
+    def fake_transcribe(path):
+        import wave
+        with wave.open(path, "rb") as wf:
+            return f"n{wf.getnframes()}"       # must be a str (non-speech filter)
+
+    sm = w.SessionManager(
+        ring=w.RingBuffer(maxlen=400),
+        chunk_dir=str(tmp_path),
+        transcribe_fn=fake_transcribe,
+        type_fn=lambda text, wid: typed.append(int(text[1:])),
+        get_window_fn=lambda: None,
+        trailing_sec=0.4,                      # real wall-clock trailing window
+    )
+    sm.start()
+    for _ in range(20):                        # 20 blocks of speech during session
+        sm.ring.append(time.monotonic(), _speech_blk())
+
+    # A "final word" that lands 0.1s INTO the trailing window (after stop begins).
+    def late_word():
+        time.sleep(0.1)
+        for _ in range(10):
+            sm.ring.append(time.monotonic(), _speech_blk())
+    threading.Thread(target=late_word).start()
+
+    sm.stop()                                  # sleeps 0.4s; late blocks tee in
+    total = sum(typed)
+    assert total >= 30 * w.BLOCK_SAMPLES, (
+        f"trailing audio dropped: got {total} samples, expected >= {30 * w.BLOCK_SAMPLES}")
 
 
 # ------------------------------------------------------------------ control_loop

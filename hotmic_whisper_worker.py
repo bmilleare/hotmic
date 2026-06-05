@@ -59,6 +59,10 @@ MIN_CHUNK_SAMPLES = int(RATE * 0.3)  # ignore chunks shorter than 0.3s
 # keypress. See docs/superpowers/specs/2026-06-04-continuous-capture-ring-buffer.
 RING_SECONDS = float(os.environ.get("RING_SECONDS", "10"))
 LOOKBACK_SEC = float(os.environ.get("LOOKBACK_SEC", "0.5"))
+# Trailing buffer: keep capturing this long AFTER the stop keypress, so the final
+# word — which the user often finishes saying as/just after they hit the hotkey —
+# is included. Symmetric with LOOKBACK_SEC at the start.
+TRAILING_SEC = float(os.environ.get("TRAILING_SEC", "0.5"))
 RING_BLOCKS = max(1, int(RING_SECONDS / 0.05))  # 50ms blocks -> 200 for 10s
 CONTROL_FIFO = f"{DIR}/control.fifo"
 PAUSED_FLAG = f"{DIR}/paused"
@@ -161,7 +165,8 @@ class SessionManager:
     """Owns the lifecycle of one dictation at a time over the live ring buffer."""
 
     def __init__(self, ring, chunk_dir, transcribe_fn, type_fn, get_window_fn,
-                 log_fn=lambda m: None, clock=time.monotonic, lookback_sec=LOOKBACK_SEC):
+                 log_fn=lambda m: None, clock=time.monotonic, lookback_sec=LOOKBACK_SEC,
+                 trailing_sec=TRAILING_SEC):
         self.ring = ring
         self.chunk_dir = chunk_dir
         self.transcribe_fn = transcribe_fn
@@ -170,6 +175,7 @@ class SessionManager:
         self.log = log_fn
         self.clock = clock
         self.lookback_sec = lookback_sec
+        self.trailing_sec = trailing_sec
         self.active = Event()
         self._threads = []
         self.last_end = [clock()]
@@ -189,9 +195,16 @@ class SessionManager:
         self._threads = [chunker, transcriber]
         self.log(f"session started (window {window_id})")
 
-    def stop(self):
+    def stop(self, trailing=None):
         if not self.active.is_set():
             return
+        # Keep the tee armed for a trailing window so audio still arriving right
+        # after the stop keypress (the tail of the final word) is captured. The
+        # capture thread keeps appending to the live session queue during the
+        # sleep; only then do we close it. trailing=0 stops immediately (pause).
+        wait = self.trailing_sec if trailing is None else trailing
+        if wait > 0:
+            time.sleep(wait)
         self.ring.stop_session()          # disarms tee + pushes sentinel to session_q
         for t in self._threads:
             t.join(timeout=30)
@@ -537,7 +550,7 @@ def main():
 
     def do_pause():
         if sm.active.is_set():
-            sm.stop()
+            sm.stop(trailing=0)   # release the mic immediately on pause
             in_session.clear()
         stop_capture()
         open(PAUSED_FLAG, "w").close()
