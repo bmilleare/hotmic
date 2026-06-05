@@ -267,6 +267,30 @@ def test_stop_includes_trailing_audio(tmp_path):
         f"trailing audio dropped: got {total} samples, expected >= {30 * w.BLOCK_SAMPLES}")
 
 
+# --------------------------------------------------- collapse_repeated_segments
+
+def test_collapse_drops_consecutive_duplicate_segments():
+    # whisper repetition loop: same sentence many times -> one
+    segs = [" I'm going to go ahead and close the door."] * 17
+    assert w.collapse_repeated_segments(segs) == "I'm going to go ahead and close the door."
+
+
+def test_collapse_joins_distinct_segments_with_single_space():
+    segs = [" the memory leak", " as soon as hot mic starts"]
+    assert w.collapse_repeated_segments(segs) == "the memory leak as soon as hot mic starts"
+
+
+def test_collapse_keeps_non_adjacent_repeats():
+    # legitimately repeated but separated -> kept (only ADJACENT dupes collapse)
+    segs = [" go left", " then right", " go left"]
+    assert w.collapse_repeated_segments(segs) == "go left then right go left"
+
+
+def test_collapse_ignores_empty_segments():
+    segs = ["  ", " hello", "   ", " hello"]
+    assert w.collapse_repeated_segments(segs) == "hello"
+
+
 # ------------------------------------------------------------------ control_loop
 
 def test_control_thread_dispatches_commands(tmp_path):

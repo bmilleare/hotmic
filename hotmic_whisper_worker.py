@@ -308,12 +308,34 @@ def control_loop(fifo_path, handlers, stop_event):
                 log(f"unknown control command: {cmd!r}")
 
 
+def collapse_repeated_segments(texts):
+    """Join whisper segment texts, dropping empty ones and collapsing CONSECUTIVE
+    duplicates. Whisper's decoding loop on non-speech emits the same sentence many
+    times ("...close the door." x17); this collapses that to one. Distinct or
+    non-adjacent segments are preserved. Joins with a single space (no doubles)."""
+    out = []
+    for t in texts:
+        t = t.strip()
+        if not t:
+            continue
+        if out and t == out[-1]:
+            continue
+        out.append(t)
+    return " ".join(out).strip()
+
+
 def make_transcribe_fn(model_holder):
     """Adapt the resident whisper model to SessionManager's transcribe_fn(path)."""
     def transcribe(path):
         model = model_holder[0]
-        segments, _ = model.transcribe(path, language="en", beam_size=1, temperature=0)
-        return " ".join(s.text for s in segments).strip()
+        # vad_filter strips non-speech before decoding -> no hallucinated phrases
+        # on silence/noise. condition_on_previous_text=False stops the decoder
+        # feeding its own output back, which is what sustains repetition loops.
+        segments, _ = model.transcribe(
+            path, language="en", beam_size=1, temperature=0,
+            vad_filter=True, condition_on_previous_text=False,
+        )
+        return collapse_repeated_segments(s.text for s in segments)
     return transcribe
 
 
