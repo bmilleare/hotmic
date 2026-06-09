@@ -44,7 +44,7 @@ SAMPWIDTH = 2  # 16-bit
 
 # Splitting config (overridable via env)
 MAX_CHUNK_SEC = int(os.environ.get("MAX_CHUNK_SEC", "20"))
-SILENCE_DUR = float(os.environ.get("SILENCE_DUR", "0.8"))
+SILENCE_DUR = float(os.environ.get("SILENCE_DUR", "2.0"))  # pause to end a chunk; >natural mid-sentence breaths so it only splits at real sentence ends
 SILENCE_THRESH = float(os.environ.get("SILENCE_THRESH", "0.03"))  # 3% as fraction
 
 # Analysis block size
